@@ -1,0 +1,35 @@
+# https://golangci-lint.run/
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - gocyclo
+  settings:
+    gocyclo:
+      min-complexity: 70
+    errcheck:
+      exclude-functions:
+        # terminal output: nothing useful to do if stdout/stderr is gone
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - io.WriteString
+        - (*github.com/spf13/cobra.Command).Help
+        # deferred cleanup after the checked Commit / Close / Flush+Error
+        - (*database/sql.Tx).Rollback
+        - (*database/sql.Rows).Close
+        - (*database/sql.DB).Close
+        - (*os.File).Close
+        - (*encoding/csv.Writer).Write
+  exclusions:
+    rules:
+      # user-facing messages start with a capital letter
+      - linters: [staticcheck]
+        text: "ST1005"
+      # test setup calls (MkdirAll, Symlink, Exec) fail the assertions that follow
+      - path: _test\.go
+        linters: [errcheck]
+
+run:
+  timeout: 5m

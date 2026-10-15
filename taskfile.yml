@@ -1,0 +1,70 @@
+version: "3"
+
+includes:
+  local:
+    taskfile: ./taskfile.local.yml
+    optional: true
+    flatten: true
+
+vars:
+  BIN_DIR: "{{.ROOT_DIR}}/bin"
+  GOLANGCI_LINT_VERSION: v2.12.1
+  GOVULNCHECK_VERSION: latest
+
+tasks:
+  setup:
+    desc: Install lint tools into ./bin
+    cmds:
+      - mkdir -p {{.BIN_DIR}}
+      - |
+        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh |
+        sh -s -- -b {{.BIN_DIR}} {{.GOLANGCI_LINT_VERSION}}
+      - GOBIN={{.BIN_DIR}} go install golang.org/x/vuln/cmd/govulncheck@{{.GOVULNCHECK_VERSION}}
+
+  setup:ensure:
+    desc: Install lint tools if any are missing from ./bin
+    internal: true
+    status:
+      - test -x {{.BIN_DIR}}/golangci-lint
+      - test -x {{.BIN_DIR}}/govulncheck
+    cmds:
+      - task: setup
+
+  lint:
+    desc: Run golangci-lint (standard linters incl. errcheck, ineffassign, plus gocyclo)
+    deps: [setup:ensure]
+    cmds:
+      - "{{.BIN_DIR}}/golangci-lint run ./..."
+
+  govulncheck:
+    desc: Run govulncheck
+    deps: [setup:ensure]
+    cmds:
+      - "{{.BIN_DIR}}/govulncheck ./..."
+
+  test:
+    desc: Fast inner-loop Go tests (no race detector)
+    cmds:
+      - go test ./...
+
+  race:
+    desc: Run Go tests with the race detector
+    cmds:
+      - go test -race ./...
+
+  build:
+    desc: Build the fileindex binary in the repo root
+    cmds:
+      - CGO_ENABLED=0 go build -ldflags="-s -w" -o fileindex ./cmd/fileindex
+
+  install:
+    desc: go install fileindex (lands in GOBIN)
+    cmds:
+      - CGO_ENABLED=0 go install -ldflags="-s -w" ./cmd/fileindex
+
+  verify:
+    desc: Merge-ready local gate (lint + race tests + binary)
+    cmds:
+      - task: lint
+      - task: race
+      - task: build

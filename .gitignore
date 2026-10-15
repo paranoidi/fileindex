@@ -1,0 +1,5 @@
+*.txt
+.scratch/
+/bin/
+/fileindex
+taskfile.local.yml
