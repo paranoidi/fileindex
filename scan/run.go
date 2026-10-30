@@ -89,7 +89,8 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 	}
 
 	var discoverErr error
-	paths := discover(ctx, d, opt.Rules, roots, opt.MissingOnly, r, &res, &discoverErr)
+	rt := newRootTracker(r, len(roots))
+	paths := discover(ctx, d, opt.Rules, roots, opt.MissingOnly, r, rt, &res, &discoverErr)
 	if opt.MissingOnly {
 		// Discover fully before hashing, so -m's reads don't interleave with batch writes.
 		paths = slices.Values(slices.Collect(paths))
@@ -105,6 +106,7 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 	var batch []db.ScannedFile
 	var batchSize int64
 	var inflight chan committed // nil when no commit is running
+	batches := 0                // commits started; the batch being filled is number batches
 	wait := func() error {
 		if inflight == nil {
 			return nil
@@ -114,6 +116,7 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 		if c.err != nil {
 			return c.err
 		}
+		rt.commitDone(batches)
 		res.Added += c.res.Added
 		res.Updated += c.res.Updated
 		for i, ferr := range c.res.Failed {
@@ -134,6 +137,7 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 			ch <- committed{b, res, err}
 		}()
 		inflight, batch, batchSize = ch, nil, 0
+		batches++
 		return nil
 	}
 	// an error return must not leave a commit running against d
@@ -143,18 +147,21 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 		if h.Err != nil { // errors go to the list only, not the log too
 			res.Errored++
 			res.Errors = append(res.Errors, h.Err.Error())
+			rt.hashed(h.Path, -1)
 			continue
 		}
 		dir, err := db.Resolve(filepath.Dir(h.Path)) // stored under the real path
 		if err != nil {
 			res.Errored++
 			res.Errors = append(res.Errors, fmt.Sprintf("Error processing file info for %s: %v", h.Path, err))
+			rt.hashed(h.Path, -1)
 			continue
 		}
 		batch = append(batch, db.ScannedFile{
 			Dir: dir, Name: filepath.Base(h.Path), Size: h.Size, Mtime: h.Mtime,
 			MD5: h.Hashes.MD5, SHA256: h.Hashes.SHA256, SHA256_8KB: h.Hashes.SHA256_8KB, NoExifJPEG: h.Hashes.NoExifJPEG,
 		})
+		rt.hashed(h.Path, batches)
 		res.Processed++
 		res.TotalSize += h.Size
 		batchSize += h.Size
@@ -210,12 +217,12 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 // discover walks the roots, reporting every file. With missingOnly it drops
 // files recorded at the same resolved dir+name with the same size and mtime,
 // counting them as skipped.
-func discover(ctx context.Context, d *db.DB, rules Rules, roots []string, missingOnly bool, r Reporter, res *Stats, errOut *error) iter.Seq[string] {
+func discover(ctx context.Context, d *db.DB, rules Rules, roots []string, missingOnly bool, r Reporter, rt *rootTracker, res *Stats, errOut *error) iter.Seq[string] {
 	return func(yield func(string) bool) {
 		scanned, found := 0, 0
 		// Walk yields a dir's files together, so the last dir's records are all we keep.
 		lastDir, recorded := "", map[string]db.Recorded(nil)
-		for _, root := range roots {
+		for i, root := range roots {
 			for p := range rules.Walk(root) {
 				// Missing-only collects discovery before HashAll runs, so a cancel must stop it here.
 				if ctx.Err() != nil {
@@ -246,10 +253,14 @@ func discover(ctx context.Context, d *db.DB, rules Rules, roots []string, missin
 					}
 				}
 				r.Scan(dir, scanned, found, res.Skipped)
-				if keep && !yield(p) {
-					return
+				if keep {
+					rt.yielded(i, p)
+					if !yield(p) {
+						return
+					}
 				}
 			}
+			rt.walked(i)
 		}
 		r.Scan("", scanned, found, res.Skipped)
 	}

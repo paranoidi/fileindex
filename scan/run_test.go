@@ -236,3 +236,50 @@ func TestRequireSchemaNewer(t *testing.T) {
 		t.Errorf("Run = %v, want ErrNewerSchema", err)
 	}
 }
+
+// rootRecorder also records RootDone, checking each root's files are already
+// committed when it is reported.
+type rootRecorder struct {
+	recorder
+	t     *testing.T
+	d     *db.DB
+	dirs  []string // root dirs to check, "" = skip
+	want  []int    // files expected under dirs[i]
+	roots []int
+}
+
+func (r *rootRecorder) RootDone(i int) {
+	if r.dirs[i] != "" {
+		got, err := r.d.DirFiles(r.dirs[i])
+		if err != nil || len(got) != r.want[i] {
+			r.t.Errorf("RootDone(%d): %d files committed (err %v), want %d", i, len(got), err, r.want[i])
+		}
+	}
+	r.mu.Lock()
+	r.roots = append(r.roots, i)
+	r.mu.Unlock()
+}
+
+// Every root is reported done once, after its files are committed, including
+// a root with nothing to hash.
+func TestRunReportsRootsDone(t *testing.T) {
+	d, tree := newIndex(t)
+	write(t, tree, "harbor/anchor", "harbor/rope", "lantern", "meadow/clover")
+	opt := scan.Options{MissingOnly: true, BatchFiles: 1}
+	meadow := filepath.Join(tree, "meadow")
+	if _, err := scan.Run(context.Background(), d, []string{meadow}, opt, &recorder{}); err != nil {
+		t.Fatal(err)
+	}
+	rec := &rootRecorder{t: t, d: d,
+		dirs: []string{filepath.Join(tree, "harbor"), "", meadow},
+		want: []int{2, 0, 1},
+	}
+	args := []string{filepath.Join(tree, "harbor"), filepath.Join(tree, "lantern"), meadow}
+	if _, err := scan.Run(context.Background(), d, args, opt, rec); err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(rec.roots)
+	if !slices.Equal(rec.roots, []int{0, 1, 2}) {
+		t.Fatalf("RootDone = %v, want each of 0 1 2 once", rec.roots)
+	}
+}
