@@ -472,3 +472,61 @@ func (d *DB) RemoveTree(path string) (RemovedTree, error) {
 	r.Dirs, err = d.DeleteOrphanedDirs()
 	return r, err
 }
+
+// RemoveInstance deletes the instance at the absolute file path, its file row
+// if no other instance uses it, and the dirs left empty above it. Returns an
+// error wrapping fs.ErrNotExist if the path is not indexed. The disk is not
+// looked at.
+func (d *DB) RemoveInstance(path string) (RemovedTree, error) {
+	var r RemovedTree
+	tx, err := d.Begin()
+	if err != nil {
+		return r, err
+	}
+	defer tx.Rollback()
+	notFound := fmt.Errorf("Path '%s' not found in database: %w", path, fs.ErrNotExist)
+	dirID, found, err := DirByPath(tx, filepath.Dir(path))
+	if err != nil {
+		return r, err
+	}
+	if !found {
+		return r, notFound
+	}
+	var id, fileID int64
+	err = tx.QueryRow("SELECT id, file_id FROM instance WHERE dir_id = ? AND filename = ?", *dirID, filepath.Base(path)).Scan(&id, &fileID)
+	if err == sql.ErrNoRows {
+		return r, notFound
+	}
+	if err != nil {
+		return r, err
+	}
+	if _, err := tx.Exec("DELETE FROM instance WHERE id = ?", id); err != nil {
+		return r, err
+	}
+	r.Instances = 1
+	res, err := tx.Exec("DELETE FROM file WHERE id = ? AND NOT EXISTS (SELECT 1 FROM instance WHERE file_id = ?)", fileID, fileID)
+	if err != nil {
+		return r, err
+	}
+	r.Files, _ = res.RowsAffected()
+	// Walk up while dirs are empty; dir_tag rows go by cascade, as in DeleteOrphanedDirs.
+	for cur := *dirID; ; {
+		var parent sql.NullInt64
+		if err := tx.QueryRow("SELECT parent_id FROM dir WHERE id = ?", cur).Scan(&parent); err != nil {
+			return r, err
+		}
+		ok, err := deleteDirIfEmpty(tx, cur)
+		if err != nil {
+			return r, err
+		}
+		if !ok {
+			break
+		}
+		r.Dirs++
+		if !parent.Valid {
+			break
+		}
+		cur = parent.Int64
+	}
+	return r, tx.Commit()
+}

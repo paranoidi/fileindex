@@ -2,7 +2,9 @@ package db_test
 
 import (
 	"context"
+	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -462,4 +464,63 @@ func TestMigrateV6(t *testing.T) {
 // logTo collects PruneDir's log lines as the CLI prints them.
 func logTo(b *strings.Builder) func(string) {
 	return func(m string) { b.WriteString(m + "\n") }
+}
+
+func TestFileInfoMtime(t *testing.T) {
+	d := dbtest.New(t)
+	dbtest.AddFile(t, d, "/m/garden/lantern.jpg", "lantern")
+	r, found, err := d.FileInfo("/m/garden/lantern.jpg")
+	if err != nil || !found || r.Mtime != dbtest.Mtime || r.Size != 7 {
+		t.Errorf("FileInfo = %+v, %v, %v", r, found, err)
+	}
+}
+
+func TestRemoveInstance(t *testing.T) {
+	d := dbtest.New(t)
+	dbtest.AddFile(t, d, "/m/river/pebble.jpg", "pebble")
+	dbtest.AddFile(t, d, "/m/river/bank/willow.jpg", "willow")
+	dbtest.AddFile(t, d, "/m/meadow/clover.jpg", "clover")
+	dbtest.AddFile(t, d, "/m/meadow/clover-copy.jpg", "clover") // same file row
+	dbtest.AddFile(t, d, "/m/hill/top/cloud.jpg", "cloud")
+
+	count := func(table string) (n int) {
+		d.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n)
+		return
+	}
+	dirExists := func(p string) bool {
+		_, found, _ := db.DirByPath(d, p)
+		return found
+	}
+
+	// File row still referenced by another instance is kept.
+	files := count("file")
+	r, err := d.RemoveInstance("/m/meadow/clover.jpg")
+	if err != nil || r != (db.RemovedTree{Instances: 1}) || count("file") != files {
+		t.Errorf("shared: %+v, %v, files %d", r, err, count("file"))
+	}
+
+	// Orphaned file row and empty ancestors go; /m stays (still has other content).
+	r, err = d.RemoveInstance("/m/hill/top/cloud.jpg")
+	if err != nil || r != (db.RemovedTree{Instances: 1, Files: 1, Dirs: 2}) {
+		t.Errorf("orphan: %+v, %v", r, err)
+	}
+	if dirExists("/m/hill") || dirExists("/m/hill/top") || !dirExists("/m") {
+		t.Error("wrong dirs after removing cloud.jpg")
+	}
+
+	// Dir with another file or a subdir is kept.
+	r, err = d.RemoveInstance("/m/river/pebble.jpg")
+	if err != nil || r != (db.RemovedTree{Instances: 1, Files: 1}) || !dirExists("/m/river") {
+		t.Errorf("subdir kept: %+v, %v", r, err)
+	}
+	r, err = d.RemoveInstance("/m/meadow/clover-copy.jpg")
+	if err != nil || r.Files != 1 || r.Dirs != 1 || dirExists("/m/meadow") {
+		t.Errorf("last copy: %+v, %v", r, err)
+	}
+
+	for _, p := range []string{"/m/river/nothing.jpg", "/nowhere/nothing.jpg"} {
+		if _, err := d.RemoveInstance(p); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("RemoveInstance(%q) = %v, want ErrNotExist", p, err)
+		}
+	}
 }

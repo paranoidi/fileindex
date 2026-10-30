@@ -158,6 +158,7 @@ WHERE COALESCE(f.sha256_noexif_jpeg, f.sha256) IN (SELECT h FROM grp)`)
 // FileRecord is what the index holds for one instance.
 type FileRecord struct {
 	MD5, SHA256 string
+	Mtime       string // as stored, empty if unset
 	Size        int64
 }
 
@@ -168,8 +169,8 @@ func (d *DB) FileInfo(path string) (FileRecord, bool, error) {
 	if err != nil || !found {
 		return r, false, err
 	}
-	err = d.QueryRow(`SELECT f.md5, f.sha256, f.filesize FROM instance i JOIN file f ON i.file_id = f.id
-WHERE i.dir_id = ? AND i.filename = ?`, *dirID, filepath.Base(path)).Scan(&r.MD5, &r.SHA256, &r.Size)
+	err = d.QueryRow(`SELECT f.md5, f.sha256, f.filesize, COALESCE(CAST(i.mtime AS TEXT), '') FROM instance i JOIN file f ON i.file_id = f.id
+WHERE i.dir_id = ? AND i.filename = ?`, *dirID, filepath.Base(path)).Scan(&r.MD5, &r.SHA256, &r.Size, &r.Mtime)
 	if err == sql.ErrNoRows {
 		return r, false, nil
 	}
