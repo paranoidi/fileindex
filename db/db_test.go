@@ -335,6 +335,8 @@ func TestPruneDirListing(t *testing.T) {
 	add("real/a.jpg")
 	add("link/a.jpg") // recorded under link/, which becomes a symlink to real/
 	add("nowfile/b.jpg")
+	add("real/gone 1.jpg")
+	add("real/gone 2.jpg")
 	must := func(err error) {
 		if err != nil {
 			t.Fatal(err)
@@ -344,15 +346,19 @@ func TestPruneDirListing(t *testing.T) {
 	must(os.Symlink(filepath.Join(root, "real"), filepath.Join(root, "link")))
 	must(os.RemoveAll(filepath.Join(root, "nowfile")))
 	must(os.WriteFile(filepath.Join(root, "nowfile"), []byte("x"), 0o644))
+	must(os.Remove(filepath.Join(root, "real", "gone 1.jpg")))
+	must(os.Remove(filepath.Join(root, "real", "gone 2.jpg")))
 
 	id, _, err := db.DirByPath(d, root)
 	must(err)
 	var out strings.Builder
 	files, dirs, err := d.PruneDir(context.Background(), root, *id, nil, logTo(&out))
 	must(err)
-	if files != 1 || dirs != 1 || !strings.Contains(out.String(), "nowfile") {
+	if files != 3 || dirs != 1 || !strings.Contains(out.String(), "nowfile") ||
+		!strings.Contains(out.String(), "gone 1.jpg") || !strings.Contains(out.String(), "gone 2.jpg") {
 		t.Errorf("removed %d files, %d dirs:\n%s", files, dirs, out.String())
 	}
+	ftsIntegrity(t, d, "prune")
 
 	if os.Geteuid() == 0 {
 		return // root lists anything

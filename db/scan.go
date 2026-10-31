@@ -308,25 +308,35 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 				present[e.Name()] = e
 			}
 		}
+		var goneNames []string
 		for _, name := range names {
 			if _, ok := present[name]; ok {
 				continue
 			}
-			p := filepath.Join(cur.path, name)
-			gone, _, err := missing(p)
+			gone, _, err := missing(filepath.Join(cur.path, name))
 			if err != nil {
 				return files, dirs, err
 			}
-			if !gone {
-				continue
+			if gone {
+				goneNames = append(goneNames, name)
 			}
-			r, err := tx.Exec("DELETE FROM instance WHERE dir_id = ? AND filename = ?", cur.id, name)
+		}
+		if len(goneNames) > 0 {
+			// One statement per dir: FTS5 flushes a segment at every statement
+			// savepoint, and the delete trigger gave each per-row DELETE one.
+			// The names were just listed in this tx, so each one deletes a row.
+			list, err := json.Marshal(goneNames)
 			if err != nil {
 				return files, dirs, err
 			}
-			if n, _ := r.RowsAffected(); n > 0 {
-				files, pending = files+n, pending+n
-				log("Pruning removed file: " + p)
+			r, err := tx.Exec("DELETE FROM instance WHERE dir_id = ? AND filename IN (SELECT value FROM json_each(?))", cur.id, string(list))
+			if err != nil {
+				return files, dirs, err
+			}
+			n, _ := r.RowsAffected()
+			files, pending = files+n, pending+n
+			for _, name := range goneNames {
+				log("Pruning removed file: " + filepath.Join(cur.path, name))
 			}
 		}
 
