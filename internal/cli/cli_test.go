@@ -151,3 +151,11 @@ func TestDatabasePathFromEnvAndConfigFlag(t *testing.T) {
 		t.Fatalf("got %q", out)
 	}
 }
+
+func TestVersion(t *testing.T) {
+	h := newHarness(t)
+	code, out, errOut := h.run("--version")
+	if code != 0 || !strings.HasPrefix(out, "fileindex version ") || errOut != "" {
+		t.Fatalf("code=%d out=%q err=%q", code, out, errOut)
+	}
+}

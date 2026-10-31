@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"sync/atomic"
 
 	"github.com/spf13/cobra"
@@ -48,6 +49,14 @@ func (a *app) openDB() (*db.DB, error) {
 	return a.db, nil
 }
 
+// version is the git tag go build stamped into the binary, or "(devel)".
+func version() string {
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" {
+		return bi.Main.Version
+	}
+	return "(devel)"
+}
+
 // Run executes one fileindex invocation and returns its exit code.
 // Usage errors exit 2, command errors print "Error: <msg>" and exit 1.
 func Run(args []string, stdout, stderr io.Writer) int {
@@ -77,6 +86,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	root := &cobra.Command{
 		Use:           "fileindex",
 		Short:         "Index local files by content hash",
+		Version:       version(),
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {

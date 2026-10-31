@@ -68,3 +68,24 @@ tasks:
       - task: lint
       - task: race
       - task: build
+
+  release:
+    desc: "Verify, tag next semver, push: task release -- patch|minor|major"
+    preconditions:
+      - sh: test -z "$(git status --porcelain)"
+        msg: working tree not clean
+      - sh: test "$(git branch --show-current)" = main
+        msg: release from main only
+    cmds:
+      - task: verify
+      - |
+        last=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo v0.0.0)
+        IFS=. read -r maj min pat <<<"${last#v}"
+        case "{{.CLI_ARGS | default "patch"}}" in
+          major) next=v$((maj+1)).0.0 ;;
+          minor) next=v$maj.$((min+1)).0 ;;
+          patch) next=v$maj.$min.$((pat+1)) ;;
+          *) echo "usage: task release -- patch|minor|major"; exit 1 ;;
+        esac
+        git tag -a "$next" -m "$next"
+        git push --atomic origin main "$next"
