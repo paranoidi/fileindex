@@ -7,11 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"time"
 
 	"github.com/paranoidi/fileindex/db"
 )
 
-// A batch is committed at whichever limit is reached first.
+// A batch is committed at whichever limit is reached first (Options.BatchInterval
+// replaces the file count).
 const (
 	batchFiles       = 1000
 	batchBytes int64 = 1 << 30
@@ -23,6 +25,10 @@ type Options struct {
 	Workers     int  // hash workers; 0 = auto-scale
 	MissingOnly bool // skip files indexed with the same size and mtime (the CLI's default; --all turns it off)
 	BatchFiles  int  // files per commit; 0 = 1000. Smaller batches make a cancel land sooner.
+	// BatchInterval, when > 0, commits a batch once this long has passed since its
+	// first file instead of after BatchFiles files. Every commit flushes the
+	// full-text index, so with many small files fewer, larger commits scan faster.
+	BatchInterval time.Duration
 }
 
 // Reporter receives Run's progress. Worker, Speed and Scan are called from
@@ -105,6 +111,7 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 	}
 	var batch []db.ScannedFile
 	var batchSize int64
+	var batchStart time.Time    // when the batch being filled got its first file
 	var inflight chan committed // nil when no commit is running
 	batches := 0                // commits started; the batch being filled is number batches
 	wait := func() error {
@@ -157,6 +164,9 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 			rt.hashed(h.Path, -1)
 			continue
 		}
+		if len(batch) == 0 {
+			batchStart = time.Now()
+		}
 		batch = append(batch, db.ScannedFile{
 			Dir: dir, Name: filepath.Base(h.Path), Size: h.Size, Mtime: h.Mtime,
 			MD5: h.Hashes.MD5, SHA256: h.Hashes.SHA256, SHA256_8KB: h.Hashes.SHA256_8KB, NoExifJPEG: h.Hashes.NoExifJPEG,
@@ -165,7 +175,11 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 		res.Processed++
 		res.TotalSize += h.Size
 		batchSize += h.Size
-		if len(batch) >= maxFiles || batchSize >= batchBytes {
+		full := len(batch) >= maxFiles
+		if opt.BatchInterval > 0 {
+			full = time.Since(batchStart) >= opt.BatchInterval
+		}
+		if full || batchSize >= batchBytes {
 			if err := commit(); err != nil {
 				return res, err
 			}

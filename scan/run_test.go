@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/paranoidi/fileindex/config"
 	"github.com/paranoidi/fileindex/db"
@@ -281,5 +282,36 @@ func TestRunReportsRootsDone(t *testing.T) {
 	slices.Sort(rec.roots)
 	if !slices.Equal(rec.roots, []int{0, 1, 2}) {
 		t.Fatalf("RootDone = %v, want each of 0 1 2 once", rec.roots)
+	}
+}
+
+// commitCounter counts committed instances each time a root is reported done.
+type commitCounter struct {
+	recorder
+	d    *db.DB
+	seen []int
+}
+
+func (c *commitCounter) RootDone(int) {
+	var n int
+	_ = c.d.QueryRow("SELECT COUNT(*) FROM instance").Scan(&n)
+	c.mu.Lock()
+	c.seen = append(c.seen, n)
+	c.mu.Unlock()
+}
+
+// BatchInterval replaces the file count: with a long interval every file lands
+// in the final commit, so every root is reported done with all of them stored.
+func TestRunBatchIntervalReplacesFileCount(t *testing.T) {
+	d, tree := newIndex(t)
+	write(t, tree, "harbor/anchor", "harbor/rope", "meadow/clover")
+	rec := &commitCounter{d: d}
+	opt := scan.Options{MissingOnly: true, Workers: 1, BatchFiles: 1, BatchInterval: time.Hour}
+	args := []string{filepath.Join(tree, "harbor"), filepath.Join(tree, "meadow")}
+	if _, err := scan.Run(context.Background(), d, args, opt, rec); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(rec.seen, []int{3, 3}) {
+		t.Fatalf("instances stored at each RootDone = %v, want [3 3]", rec.seen)
 	}
 }
