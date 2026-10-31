@@ -1,0 +1,12 @@
+version: 2
+
+builds:
+  - main: ./cmd/fileindex
+    env: [CGO_ENABLED=0]
+    flags: [-trimpath]
+    ldflags: [-s -w] # version comes from the git tag via Go's build info
+    goos: [linux, darwin] # ponytail: no windows, progress/walk use unix-only syscalls
+    goarch: [amd64, arm64]
+
+changelog:
+  use: github-native

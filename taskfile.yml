@@ -79,8 +79,8 @@ tasks:
     cmds:
       - task: verify
       - |
-        last=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo v0.0.0)
-        IFS=. read -r maj min pat <<<"${last#v}"
+        last=$(git tag -l 'v*' --sort=-v:refname | head -n1)
+        IFS=. read -r maj min pat <<<"${last:-v0.0.0}"; maj=${maj#v}
         case "{{.CLI_ARGS | default "patch"}}" in
           major) next=v$((maj+1)).0.0 ;;
           minor) next=v$maj.$((min+1)).0 ;;
