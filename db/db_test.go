@@ -524,3 +524,32 @@ func TestRemoveInstance(t *testing.T) {
 		}
 	}
 }
+
+// CommitScanBatch inserts new instances in one statement; counts, a path seen
+// twice in a batch, and the FTS indexes must come out as with per-row inserts.
+func TestCommitScanBatch(t *testing.T) {
+	paths := pathsOf(t)
+	d := dbtest.New(t)
+	f := func(dir, name, hash string) db.ScannedFile {
+		return db.ScannedFile{Dir: dir, Name: name, Size: 1, Mtime: time.Unix(1700000000, 0),
+			MD5: hash[:4], SHA256: hash, SHA256_8KB: hash}
+	}
+	res, err := d.CommitScanBatch([]db.ScannedFile{
+		f("/m", "holiday_beach.jpg", "aaaa1"), f("/m/sub", "snow day.png", "bbbb1"), f("/m", "holiday_beach.jpg", "cccc1"),
+	})
+	if err != nil || res.Added != 2 || res.Updated != 1 || len(res.Failed) != 0 {
+		t.Fatalf("first batch: %+v, %v", res, err)
+	}
+	if res, err = d.CommitScanBatch([]db.ScannedFile{f("/m/sub", "snow day.png", "dddd1"), f("/m", "new.txt", "eeee1")}); err != nil || res.Added != 1 || res.Updated != 1 {
+		t.Fatalf("second batch: %+v, %v", res, err)
+	}
+	ftsIntegrity(t, d, "scan batches")
+	root, _, _ := db.DirByPath(d, "/m")
+	if got := paths(d.FindByWords("holiday OR snow", *root)); got != "/m/holiday_beach.jpg /m/sub/snow day.png" {
+		t.Errorf("words: %q", got)
+	}
+	var sha string
+	if err := d.QueryRow("SELECT f.sha256 FROM instance i JOIN file f ON f.id = i.file_id WHERE i.filename = 'holiday_beach.jpg'").Scan(&sha); err != nil || sha != "cccc1" {
+		t.Errorf("duplicate in batch: last should win, got %q, %v", sha, err)
+	}
+}

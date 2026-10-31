@@ -35,6 +35,9 @@ type DB struct {
 // synchronous=NORMAL: in WAL mode commits skip fsync (only checkpoints sync), so
 // a slow fsync on a busy disk no longer stalls scan; a power loss can drop the
 // last few commits, which a rescan redoes.
+// wal_autocheckpoint(16000): checkpoint at a 64 MiB WAL instead of 4 MiB; each
+// checkpoint runs inside a commit and fsyncs, and was a fifth of scan's commit
+// time. The WAL file stays at its high-water mark afterwards.
 // Another process may hold it open for hours alongside CLI scans: WAL lets
 // readers run during a scan's writes, and busy_timeout makes writers wait
 // their turn instead of failing.
@@ -43,7 +46,7 @@ func Open(path string) (*DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	sdb, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(30000)&_pragma=foreign_keys(1)&_pragma=cache_size(-65536)&_pragma=synchronous(1)")
+	sdb, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(30000)&_pragma=foreign_keys(1)&_pragma=cache_size(-65536)&_pragma=synchronous(1)&_pragma=wal_autocheckpoint(16000)")
 	if err != nil {
 		return nil, err
 	}

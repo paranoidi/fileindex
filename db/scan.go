@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -117,6 +118,8 @@ func (d *DB) CommitScanBatch(files []ScannedFile) (BatchResult, error) {
 	defer tx.Rollback()
 	q := &stmtCache{tx: tx, stmts: map[string]*sql.Stmt{}}
 	dirs := map[string]*int64{} // a batch is mostly a few dirs; resolve each once
+	var newRows [][]any         // instances to insert, in one statement at the end
+	added := map[newKey]int{}   // index into newRows
 	for i, f := range files {
 		var fileID int64
 		err := q.QueryRow("SELECT id FROM file WHERE sha256 = ?", f.SHA256).Scan(&fileID)
@@ -160,15 +163,41 @@ sha256_noexif_jpeg = CASE WHEN ? THEN ? ELSE sha256_noexif_jpeg END WHERE id = ?
 			res.Updated++
 			_, err = q.Exec("UPDATE instance SET file_id = ?, mtime = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?", fileID, mtime, instID)
 		case sql.ErrNoRows:
+			k := newKey{dirID, f.Name}
+			if j, dup := added[k]; dup { // same resolved path twice in one batch: the last one wins
+				res.Updated++
+				newRows[j] = []any{fileID, dirID, f.Name, Lower(f.Name), mtime}
+				continue
+			}
 			res.Added++
-			_, err = q.Exec("INSERT INTO instance (file_id, dir_id, filename, filename_lower, mtime) VALUES (?, ?, ?, ?, ?)",
-				fileID, dirID, f.Name, Lower(f.Name), mtime)
+			err = nil
+			added[k] = len(newRows)
+			newRows = append(newRows, []any{fileID, dirID, f.Name, Lower(f.Name), mtime})
 		}
 		if err != nil {
 			return res, err
 		}
 	}
+	if len(newRows) > 0 {
+		// One statement for all new instances: FTS5 flushes its pending terms to
+		// a new segment at every statement savepoint, so a per-row INSERT (its
+		// triggers need one) wrote and merged an FTS segment per file.
+		rows, err := json.Marshal(newRows)
+		if err != nil {
+			return res, err
+		}
+		if _, err := tx.Exec(`INSERT INTO instance (file_id, dir_id, filename, filename_lower, mtime)
+SELECT value->>0, value->>1, value->>2, value->>3, value->>4 FROM json_each(?)`, string(rows)); err != nil {
+			return res, err
+		}
+	}
 	return res, tx.Commit()
+}
+
+// newKey identifies an instance CommitScanBatch is about to insert.
+type newKey struct {
+	dir  *int64
+	name string
 }
 
 // DeleteInstancesInTree deletes every instance in the dir's subtree and returns the count.
