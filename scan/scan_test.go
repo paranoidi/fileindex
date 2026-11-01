@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"image"
 	"image/jpeg"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -363,4 +364,18 @@ func TestScaler(t *testing.T) {
 	run(280, 2) // n == 1, so probe up even though down was due
 	run(500, 3)
 	run(400, 2) // dropped: scale back
+}
+
+// A library caller must never get log text on its terminal: walk warnings go to
+// Logger, which discards by default, not to the global slog default (stderr).
+func TestWalkWarningsDoNotReachDefaultLogger(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+	for range (Rules{}).Walk(filepath.Join(t.TempDir(), "missing")) {
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("walk logged to the default logger: %q", buf.String())
+	}
 }

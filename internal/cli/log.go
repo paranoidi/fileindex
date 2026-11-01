@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+
+	"github.com/paranoidi/fileindex/scan"
 )
 
 // logHandler writes slog records as:
@@ -49,5 +51,6 @@ func setupLogging(out io.Writer, verbose bool, level string) {
 	if verbose {
 		l = slog.LevelDebug
 	}
-	slog.SetDefault(slog.New(logHandler{&sync.Mutex{}, out, l}))
+	scan.Logger = slog.New(logHandler{&sync.Mutex{}, out, l})
+	slog.SetDefault(scan.Logger)
 }

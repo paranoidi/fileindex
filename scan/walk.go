@@ -78,7 +78,7 @@ func (r Rules) Walk(root string) iter.Seq[string] {
 	return func(yield func(string) bool) {
 		fi, err := os.Stat(root)
 		if err != nil {
-			slog.Warn("Path does not exist: " + root)
+			Logger.Warn("Path does not exist: " + root)
 			return
 		}
 		if !fi.IsDir() {
@@ -98,7 +98,7 @@ func (r Rules) Walk(root string) iter.Seq[string] {
 func (r Rules) walkDir(dir string, visited map[DirKey]bool, yield func(string) bool) bool {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		slog.Warn(fmt.Sprintf("Error walking directory: %v", err))
+		Logger.Warn(fmt.Sprintf("Error walking directory: %v", err))
 		return true
 	}
 	var subdirs []string
@@ -124,13 +124,13 @@ func (r Rules) walkDir(dir string, visited map[DirKey]bool, yield func(string) b
 		fi, err := os.Stat(p)
 		switch {
 		case os.IsNotExist(err):
-			slog.Debug("File disappeared during scan: " + p)
+			Logger.Debug("File disappeared during scan: " + p)
 		case err != nil:
-			slog.Warn(fmt.Sprintf("Error accessing file %s: %v", p, err))
+			Logger.Warn(fmt.Sprintf("Error accessing file %s: %v", p, err))
 		case !fi.Mode().IsRegular():
-			slog.Debug("Skipping non-regular file: " + p)
+			Logger.Debug("Skipping non-regular file: " + p)
 		case fi.Size() == 0:
-			slog.Debug("Skipping 0-byte file: " + p)
+			Logger.Debug("Skipping 0-byte file: " + p)
 		default:
 			if !yield(p) {
 				return false
@@ -140,7 +140,7 @@ func (r Rules) walkDir(dir string, visited map[DirKey]bool, yield func(string) b
 	for _, sub := range subdirs {
 		fi, err := os.Stat(sub)
 		if err != nil {
-			slog.Warn(fmt.Sprintf("Error walking directory: %v", err))
+			Logger.Warn(fmt.Sprintf("Error walking directory: %v", err))
 			continue
 		}
 		if k, ok := KeyOf(fi); ok {
@@ -155,3 +155,8 @@ func (r Rules) walkDir(dir string, visited map[DirKey]bool, yield func(string) b
 	}
 	return true
 }
+
+// Logger receives the walk and hash warnings. It discards by default so a host
+// program (a TUI) never gets text on its terminal; the CLI points it at its own
+// handler.
+var Logger = slog.New(slog.DiscardHandler)

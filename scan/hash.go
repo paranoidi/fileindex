@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"iter"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,7 +103,7 @@ func hashContent(path string, read *atomic.Int64) (Hashes, error) {
 			s := sha256Hex(stripped)
 			h.NoExifJPEG = &s
 		} else {
-			slog.Warn(fmt.Sprintf("Error calculating metadata-stripped hash for %s: %v (type: ValueError)", path, err))
+			Logger.Warn(fmt.Sprintf("Error calculating metadata-stripped hash for %s: %v (type: ValueError)", path, err))
 		}
 		return h, nil
 	}
