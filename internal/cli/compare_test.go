@@ -19,6 +19,8 @@ func TestDuplicates(t *testing.T) {
 	dbtest.AddFile(t, d, "/m/dir1/c.jpg", "inner")
 	dbtest.AddFile(t, d, "/m/dir1/sub/d.jpg", "inner")
 	dbtest.AddFile(t, d, "/m/dir3/lonely.jpg", "lonely")
+	dbtest.AddFile(t, d, "/m/dir1/empty.jpg", "") // empty files share a hash but are no duplicates
+	dbtest.AddFile(t, d, "/m/dir2/empty.jpg", "")
 
 	want := "Finding duplicates...\nFound 2 sets of duplicate files:\n\n" +
 		"1. File size: 5 bytes (2 instances)\n     /m/dir1/c.jpg\n     /m/dir1/sub/d.jpg\n\n" +

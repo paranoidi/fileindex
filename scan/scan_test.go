@@ -110,14 +110,14 @@ func TestWalkPatternCase(t *testing.T) {
 	}
 }
 
-func TestWalkSkipsEmptyAndSpecial(t *testing.T) {
+func TestWalkIncludesEmptySkipsSpecial(t *testing.T) {
 	d := t.TempDir()
 	write(t, filepath.Join(d, "file1.txt"), "content1")
 	write(t, filepath.Join(d, "empty.txt"), "")
 	os.Symlink(filepath.Join(d, "nowhere.txt"), filepath.Join(d, "dangling.txt"))
 	os.Symlink(filepath.Join(d, "file1.txt"), filepath.Join(d, "link.txt"))
 	r := Rules{Patterns: []string{"*.txt"}}
-	if got := names(slices.Collect(r.Walk(d))); !slices.Equal(got, []string{"file1.txt", "link.txt"}) {
+	if got := names(slices.Collect(r.Walk(d))); !slices.Equal(got, []string{"empty.txt", "file1.txt", "link.txt"}) {
 		t.Errorf("got %q", got)
 	}
 	// a file root is yielded alone; the include patterns still apply

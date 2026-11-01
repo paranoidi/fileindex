@@ -137,7 +137,7 @@ func (a *app) fsCheck(root string, recorded []string, recursive bool) (missing, 
 			for _, e := range entries {
 				p := filepath.Join(root, e.Name())
 				fi, err := os.Stat(p)
-				if err == nil && fi.Mode().IsRegular() && fi.Size() > 0 && rules.IncludeFile(e.Name()) {
+				if err == nil && fi.Mode().IsRegular() && rules.IncludeFile(e.Name()) {
 					onDisk[p] = true
 				}
 			}

@@ -74,6 +74,7 @@ func (d *DB) Duplicates(filter []int64, within bool) ([]DupGroup, error) {
 	rows, err := d.Query(`WITH grp AS (
     SELECT COALESCE(f.sha256_noexif_jpeg, f.sha256) AS h
     FROM file f JOIN instance i ON f.id = i.file_id
+    WHERE f.filesize > 0
     GROUP BY h HAVING COUNT(i.id) > 1
 )
 SELECT COALESCE(f.sha256_noexif_jpeg, f.sha256), f.filesize, i.dir_id, i.filename

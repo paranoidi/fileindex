@@ -82,7 +82,7 @@ func (r Rules) Walk(root string) iter.Seq[string] {
 			return
 		}
 		if !fi.IsDir() {
-			if r.IncludeFile(filepath.Base(root)) && fi.Size() > 0 {
+			if r.IncludeFile(filepath.Base(root)) && fi.Mode().IsRegular() {
 				yield(root)
 			}
 			return
@@ -129,8 +129,6 @@ func (r Rules) walkDir(dir string, visited map[DirKey]bool, yield func(string) b
 			Logger.Warn(fmt.Sprintf("Error accessing file %s: %v", p, err))
 		case !fi.Mode().IsRegular():
 			Logger.Debug("Skipping non-regular file: " + p)
-		case fi.Size() == 0:
-			Logger.Debug("Skipping 0-byte file: " + p)
 		default:
 			if !yield(p) {
 				return false

@@ -303,14 +303,14 @@ func TestLs(t *testing.T) {
 		t.Errorf("got %q\nwant %q", out, want)
 	}
 
-	// differences: one file gone, two new (one excluded by pattern, one empty and ignored)
+	// differences: one file gone, three new and one excluded by pattern
 	os.Remove(filepath.Join(tree, "a.jpg"))
 	writeFile(t, filepath.Join(tree, "b.jpg"), "b")
 	writeFile(t, filepath.Join(tree, "c.jpg"), "c")
 	writeFile(t, filepath.Join(tree, "notes.txt"), "n")
 	writeFile(t, filepath.Join(tree, "empty.jpg"), "")
 	code, out, _ := h.run("ls", tree)
-	if code != 1 || !strings.HasSuffix(out, "\n✘ Missing files from filesystem (1):\n  a.jpg\n\n∆ Missing files from database (2):\n  b.jpg\n  c.jpg\n\n") {
+	if code != 1 || !strings.HasSuffix(out, "\n✘ Missing files from filesystem (1):\n  a.jpg\n\n∆ Missing files from database (3):\n  b.jpg\n  c.jpg\n  empty.jpg\n\n") {
 		t.Errorf("exit %d, %q", code, out)
 	}
 

@@ -264,7 +264,7 @@ func (d *DB) Stats() (Stats, error) {
 		{"SELECT COUNT(*) FROM file", &s.Files},
 		{"SELECT COUNT(*) FROM instance", &s.Instances},
 		{"SELECT COALESCE(SUM(filesize), 0) FROM file", &s.TotalSize},
-		{"SELECT COUNT(*) FROM file f WHERE (SELECT COUNT(*) FROM instance i WHERE i.file_id = f.id) > 1", &s.DuplicateFiles},
+		{"SELECT COUNT(*) FROM file f WHERE f.filesize > 0 AND (SELECT COUNT(*) FROM instance i WHERE i.file_id = f.id) > 1", &s.DuplicateFiles},
 	} {
 		if err := d.QueryRow(q.sql).Scan(q.dst); err != nil {
 			return s, err

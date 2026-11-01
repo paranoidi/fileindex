@@ -126,7 +126,7 @@ func (b *treeBuilder) build(path, name string) (*treeNode, error) {
 					b.visited[k] = true
 				}
 				fsDirs = append(fsDirs, e.Name())
-			case fi.Mode().IsRegular() && fi.Size() > 0 && b.rules.IncludeFile(e.Name()):
+			case fi.Mode().IsRegular() && b.rules.IncludeFile(e.Name()):
 				fsFiles = append(fsFiles, e.Name())
 			}
 		}

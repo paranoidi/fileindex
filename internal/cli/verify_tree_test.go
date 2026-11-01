@@ -85,13 +85,13 @@ func TestTreeCommand(t *testing.T) {
 	os.Remove(filepath.Join(tree, "both", "only_in_db.jpg"))
 	dbtest.AddFile(t, d, filepath.Join(tree, "db_only_dir", "z.jpg"), "z")
 	writeFile(t, filepath.Join(tree, "fs_only_dir", "new.jpg"), "n")
-	writeFile(t, filepath.Join(tree, "both", "empty.jpg"), "")  // 0-byte files don't count
+	writeFile(t, filepath.Join(tree, "both", "empty.jpg"), "")  // 0-byte files count
 	writeFile(t, filepath.Join(tree, ".cache", "c.jpg"), "c")   // excluded dir
 	writeFile(t, filepath.Join(tree, "both", "notes.txt"), "n") // not a scanned pattern
 
 	name := filepath.Base(tree)
 	code, out, _ := h.run("tree", tree)
-	want := name + " {db-1d, fs-1d}\n├── both {fs-1f}\n├── db_only_dir {fs-1f}\n└── fs_only_dir {db-1f}\n"
+	want := name + " {db-1d, fs-1d}\n├── both {db-1f, fs-1f}\n├── db_only_dir {fs-1f}\n└── fs_only_dir {db-1f}\n"
 	if code != 1 || out != want {
 		t.Errorf("union: exit %d\n%s\nwant\n%s", code, out, want)
 	}
