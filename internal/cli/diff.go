@@ -32,10 +32,13 @@ func (a *app) loadSide(d *db.DB, path string, id int64, recursive bool) (*side, 
 		if err != nil {
 			return nil, err
 		}
+		recorded = append(recorded, e.Path)
+		if !e.Hashed { // nothing to compare yet; still checked against the filesystem
+			continue
+		}
 		s.files[rel] = e
 		s.names = append(s.names, rel)
 		s.byHash[e.Content] = append(s.byHash[e.Content], rel)
-		recorded = append(recorded, e.Path)
 	}
 	s.missing, s.extra, err = a.fsCheck(path, recorded, recursive)
 	return s, err

@@ -30,7 +30,7 @@ func (d *DB) FindByHash(h string) ([]Match, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.Query(`SELECT i.dir_id, i.filename, f.filesize, f.md5, f.sha256,
+	rows, err := tx.Query(`SELECT i.dir_id, i.filename, i.size, f.md5, f.sha256,
 COALESCE(f.sha256_8kb, ''), COALESCE(f.sha256_noexif_jpeg, ''), COALESCE(CAST(i.mtime AS TEXT), '')
 FROM file f JOIN instance i ON f.id = i.file_id
 WHERE f.md5 = ?1 OR f.sha256 = ?1 OR f.sha256_noexif_jpeg = ?1 OR f.sha256_8kb = ?1`, h)
@@ -98,6 +98,8 @@ type Found struct {
 	Path  string
 	Size  int64
 	Mtime string
+	// Hashed is false while the instance waits to be hashed (dirs: always true).
+	Hashed bool
 }
 
 // FindByName matches basenames under the dir root (not root itself),
@@ -129,7 +131,7 @@ ORDER BY d.name`, root, like, root)
 		var ids []int64
 		start := len(out)
 		for rows.Next() {
-			f := Found{IsDir: true}
+			f := Found{IsDir: true, Hashed: true}
 			var id int64
 			if err := rows.Scan(&id, &f.Name); err != nil {
 				rows.Close()
@@ -157,8 +159,8 @@ func (d *DB) FindByWords(query string, root int64) ([]Found, error) {
 
 // findFiles returns the instances under root matching cond, sorted by name.
 func (d *DB) findFiles(cond string, root int64, args ...any) ([]Found, error) {
-	rows, err := d.Query(treeCTE+`SELECT i.dir_id, i.filename, f.filesize, COALESCE(CAST(i.mtime AS TEXT), '')
-FROM instance i JOIN file f ON i.file_id = f.id
+	rows, err := d.Query(treeCTE+`SELECT i.dir_id, i.filename, i.size, COALESCE(CAST(i.mtime AS TEXT), ''), i.file_id IS NOT NULL
+FROM instance i
 WHERE i.dir_id IN (SELECT id FROM dir_tree) AND `+cond+`
 ORDER BY i.filename, i.id`, append([]any{root}, args...)...)
 	if err != nil {
@@ -169,7 +171,7 @@ ORDER BY i.filename, i.id`, append([]any{root}, args...)...)
 	for rows.Next() {
 		var f Found
 		var dir int64
-		if err := rows.Scan(&dir, &f.Name, &f.Size, &f.Mtime); err != nil {
+		if err := rows.Scan(&dir, &f.Name, &f.Size, &f.Mtime, &f.Hashed); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -194,7 +196,9 @@ type ListedFile struct {
 	Name  string
 	Size  int64
 	Mtime string // "" when NULL
-	Tags  []string
+	// Hashed is false while the file waits to be hashed.
+	Hashed bool
+	Tags   []string
 }
 
 // ListedDir is one subdir row of a directory listing.
@@ -211,14 +215,14 @@ func (d *DB) ListDir(id int64) (files []ListedFile, subdirs []ListedDir, err err
 	if err != nil {
 		return nil, nil, err
 	}
-	rows, err := d.Query(`SELECT i.filename, f.filesize, COALESCE(CAST(i.mtime AS TEXT), '')
-FROM instance i JOIN file f ON i.file_id = f.id WHERE i.dir_id = ? ORDER BY i.filename`, id)
+	rows, err := d.Query(`SELECT i.filename, i.size, COALESCE(CAST(i.mtime AS TEXT), ''), i.file_id IS NOT NULL
+FROM instance i WHERE i.dir_id = ? ORDER BY i.filename`, id)
 	if err != nil {
 		return nil, nil, err
 	}
 	for rows.Next() {
 		var f ListedFile
-		if err := rows.Scan(&f.Name, &f.Size, &f.Mtime); err != nil {
+		if err := rows.Scan(&f.Name, &f.Size, &f.Mtime, &f.Hashed); err != nil {
 			rows.Close()
 			return nil, nil, err
 		}

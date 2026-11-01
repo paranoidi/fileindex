@@ -59,15 +59,24 @@ type ScannedFile struct {
 
 func (f ScannedFile) Path() string { return filepath.Join(f.Dir, f.Name) }
 
-// Recorded is the size and stored mtime ("" when NULL) of an indexed instance.
+// Recorded is the size and stored mtime ("" when NULL) of an indexed instance;
+// Hashed is false while the instance waits to be hashed.
 type Recorded struct {
-	Size  int64
-	Mtime string
+	Size   int64
+	Mtime  string
+	Hashed bool
 }
 
-// Unchanged reports whether the file still has the recorded size and mtime.
-func (r Recorded) Unchanged(size int64, mtime time.Time) bool {
+// Same reports whether the file still has the recorded size and mtime,
+// whether or not it is hashed.
+func (r Recorded) Same(size int64, mtime time.Time) bool {
 	return r.Size == size && r.Mtime != "" && SameMtime(r.Mtime, mtime)
+}
+
+// Unchanged reports whether the instance is hashed and the file still has the
+// recorded size and mtime; an unhashed instance always needs work.
+func (r Recorded) Unchanged(size int64, mtime time.Time) bool {
+	return r.Hashed && r.Same(size, mtime)
 }
 
 // DirFiles returns the instances recorded directly in dir, by filename; a dir
@@ -78,8 +87,8 @@ func (d *DB) DirFiles(dir string) (map[string]Recorded, error) {
 	if err != nil || !found {
 		return out, err
 	}
-	rows, err := d.Query(`SELECT i.filename, f.filesize, COALESCE(CAST(i.mtime AS TEXT), '')
-FROM instance i JOIN file f ON i.file_id = f.id WHERE i.dir_id = ?`, *dirID)
+	rows, err := d.Query(`SELECT filename, size, COALESCE(CAST(mtime AS TEXT), ''), file_id IS NOT NULL
+FROM instance WHERE dir_id = ?`, *dirID)
 	if err != nil {
 		return nil, err
 	}
@@ -87,12 +96,162 @@ FROM instance i JOIN file f ON i.file_id = f.id WHERE i.dir_id = ?`, *dirID)
 	for rows.Next() {
 		var name string
 		var r Recorded
-		if err := rows.Scan(&name, &r.Size, &r.Mtime); err != nil {
+		if err := rows.Scan(&name, &r.Size, &r.Mtime, &r.Hashed); err != nil {
 			return nil, err
 		}
 		out[name] = r
 	}
 	return out, rows.Err()
+}
+
+// DiscoveredFile is a file seen by the walk, not hashed yet. Dir is absolute and resolved.
+type DiscoveredFile struct {
+	Dir, Name string
+	Size      int64
+	Mtime     time.Time
+}
+
+// CommitDiscovered records a batch of walked files as unhashed instances, and
+// the dirs the walk entered (absolute, resolved, in walk order), in one
+// transaction, so the files are findable by name at once. An existing instance
+// gets the new size and mtime and loses its file_id: a stale hash never
+// survives a change. One INSERT writes all new instances (see CommitScanBatch).
+func (d *DB) CommitDiscovered(files []DiscoveredFile, dirs []string) (BatchResult, error) {
+	res := BatchResult{Failed: map[int]error{}}
+	tx, err := d.Begin()
+	if err != nil {
+		return res, err
+	}
+	defer tx.Rollback()
+	if err := recordDirs(tx, dirs); err != nil {
+		return res, err
+	}
+	q := &stmtCache{tx: tx, stmts: map[string]*sql.Stmt{}}
+	dirIDs := map[string]*int64{}
+	var newRows [][]any
+	added := map[newKey]int{}
+	for _, f := range files {
+		dirID, ok := dirIDs[f.Dir]
+		if !ok {
+			if dirID, err = GetOrCreatePath(q, f.Dir); err != nil {
+				return res, err
+			}
+			dirIDs[f.Dir] = dirID
+		}
+		mtime := FormatMtime(f.Mtime)
+		var instID int64
+		err := q.QueryRow("SELECT id FROM instance WHERE dir_id IS ? AND filename = ?", dirID, f.Name).Scan(&instID)
+		switch err {
+		case nil:
+			res.Updated++
+			_, err = q.Exec("UPDATE instance SET file_id = NULL, size = ?, mtime = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?", f.Size, mtime, instID)
+		case sql.ErrNoRows:
+			k := newKey{dirID, f.Name}
+			if j, dup := added[k]; dup {
+				res.Updated++
+				newRows[j] = []any{nil, dirID, f.Name, Lower(f.Name), f.Size, mtime}
+				continue
+			}
+			res.Added++
+			err = nil
+			added[k] = len(newRows)
+			newRows = append(newRows, []any{nil, dirID, f.Name, Lower(f.Name), f.Size, mtime})
+		}
+		if err != nil {
+			return res, err
+		}
+	}
+	if err := insertInstances(tx, newRows); err != nil {
+		return res, err
+	}
+	return res, tx.Commit()
+}
+
+func insertInstances(tx *sql.Tx, newRows [][]any) error {
+	if len(newRows) == 0 {
+		return nil
+	}
+	rows, err := json.Marshal(newRows)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`INSERT INTO instance (file_id, dir_id, filename, filename_lower, size, mtime)
+SELECT value->>0, value->>1, value->>2, value->>3, value->>4, value->>5 FROM json_each(?)`, string(rows))
+	return err
+}
+
+// UnhashedInstance is an instance waiting to be hashed.
+type UnhashedInstance struct {
+	ID   int64
+	Path string
+}
+
+// UnhashedUnder returns up to limit unhashed instances with id > after, by id,
+// in the dir tree at path or, when path is an indexed file, that file. Page by
+// passing the last id back; the memory held is one page.
+func (d *DB) UnhashedUnder(path string, after int64, limit int) ([]UnhashedInstance, error) {
+	q, args, err := d.unhashedScope(path)
+	if err != nil || q == "" {
+		return nil, err
+	}
+	rows, err := d.Query(q+" AND i.id > ? ORDER BY i.id LIMIT ?",
+		append(append([]any{}, args...), after, limit)...)
+	if err != nil {
+		return nil, err
+	}
+	var out []UnhashedInstance
+	var dirs []int64
+	var names []string
+	for rows.Next() {
+		var u UnhashedInstance
+		var dir int64
+		var name string
+		if err := rows.Scan(&u.ID, &dir, &name); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		out, dirs, names = append(out, u), append(dirs, dir), append(names, name)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	paths := dirPaths{}
+	for i := range out {
+		if out[i].Path, err = paths.file(d, dirs[i], names[i]); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// CountUnhashed counts the instances UnhashedUnder would page through.
+func (d *DB) CountUnhashed(path string) (int, error) {
+	q, args, err := d.unhashedScope(path)
+	if err != nil || q == "" {
+		return 0, err
+	}
+	var n int
+	err = d.QueryRow("SELECT COUNT(*) FROM ("+q+")", args...).Scan(&n)
+	return n, err
+}
+
+// unhashedScope is the query (id, dir_id, filename) of unhashed instances at
+// path; "" when path is not in the index.
+func (d *DB) unhashedScope(path string) (string, []any, error) {
+	const cols = "SELECT i.id, i.dir_id, i.filename FROM instance i WHERE i.file_id IS NULL"
+	id, found, err := DirByPath(d, path)
+	if err != nil {
+		return "", nil, err
+	}
+	if found {
+		return treeCTE + cols + " AND i.dir_id IN (SELECT id FROM dir_tree)", []any{*id}, nil
+	}
+	dirID, found, err := DirByPath(d, filepath.Dir(path))
+	if err != nil || !found {
+		return "", nil, err
+	}
+	return cols + " AND i.dir_id = ? AND i.filename = ?", []any{*dirID, filepath.Base(path)}, nil
 }
 
 // pruneBatch is how many deletions PruneDir commits at once. Tests lower it.
@@ -105,7 +264,10 @@ type BatchResult struct {
 	Failed         map[int]error
 }
 
-// CommitScanBatch records a batch of scanned files in one transaction. Files are
+// CommitScanBatch records a batch of hashed files in one transaction: each
+// instance (created if missing) gets the file row, and the size and mtime the
+// hashes were taken at, so a file that changed since the walk is stored as it
+// was hashed. Files are
 // matched by sha256; NULL hash columns of a matched row are backfilled.
 // A file whose md5 is already recorded with a different sha256 is reported as a
 // per-file failure instead of aborting the batch.
@@ -161,35 +323,28 @@ sha256_noexif_jpeg = CASE WHEN ? THEN ? ELSE sha256_noexif_jpeg END WHERE id = ?
 		switch err {
 		case nil:
 			res.Updated++
-			_, err = q.Exec("UPDATE instance SET file_id = ?, mtime = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?", fileID, mtime, instID)
+			_, err = q.Exec("UPDATE instance SET file_id = ?, size = ?, mtime = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?", fileID, f.Size, mtime, instID)
 		case sql.ErrNoRows:
 			k := newKey{dirID, f.Name}
 			if j, dup := added[k]; dup { // same resolved path twice in one batch: the last one wins
 				res.Updated++
-				newRows[j] = []any{fileID, dirID, f.Name, Lower(f.Name), mtime}
+				newRows[j] = []any{fileID, dirID, f.Name, Lower(f.Name), f.Size, mtime}
 				continue
 			}
 			res.Added++
 			err = nil
 			added[k] = len(newRows)
-			newRows = append(newRows, []any{fileID, dirID, f.Name, Lower(f.Name), mtime})
+			newRows = append(newRows, []any{fileID, dirID, f.Name, Lower(f.Name), f.Size, mtime})
 		}
 		if err != nil {
 			return res, err
 		}
 	}
-	if len(newRows) > 0 {
-		// One statement for all new instances: FTS5 flushes its pending terms to
-		// a new segment at every statement savepoint, so a per-row INSERT (its
-		// triggers need one) wrote and merged an FTS segment per file.
-		rows, err := json.Marshal(newRows)
-		if err != nil {
-			return res, err
-		}
-		if _, err := tx.Exec(`INSERT INTO instance (file_id, dir_id, filename, filename_lower, mtime)
-SELECT value->>0, value->>1, value->>2, value->>3, value->>4 FROM json_each(?)`, string(rows)); err != nil {
-			return res, err
-		}
+	// One statement for all new instances: FTS5 flushes its pending terms to
+	// a new segment at every statement savepoint, so a per-row INSERT (its
+	// triggers need one) wrote and merged an FTS segment per file.
+	if err := insertInstances(tx, newRows); err != nil {
+		return res, err
 	}
 	return res, tx.Commit()
 }
@@ -535,7 +690,8 @@ func (d *DB) RemoveInstance(path string) (RemovedTree, error) {
 	if !found {
 		return r, notFound
 	}
-	var id, fileID int64
+	var id int64
+	var fileID sql.NullInt64
 	err = tx.QueryRow("SELECT id, file_id FROM instance WHERE dir_id = ? AND filename = ?", *dirID, filepath.Base(path)).Scan(&id, &fileID)
 	if err == sql.ErrNoRows {
 		return r, notFound
@@ -547,7 +703,10 @@ func (d *DB) RemoveInstance(path string) (RemovedTree, error) {
 		return r, err
 	}
 	r.Instances = 1
-	res, err := tx.Exec("DELETE FROM file WHERE id = ? AND NOT EXISTS (SELECT 1 FROM instance WHERE file_id = ?)", fileID, fileID)
+	if !fileID.Valid {
+		return r, tx.Commit()
+	}
+	res, err := tx.Exec("DELETE FROM file WHERE id = ? AND NOT EXISTS (SELECT 1 FROM instance WHERE file_id = ?)", fileID.Int64, fileID.Int64)
 	if err != nil {
 		return r, err
 	}

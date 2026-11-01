@@ -1,10 +1,11 @@
-// Package db holds the schema v7 SQLite index and every query on it.
+// Package db holds the schema v8 SQLite index and every query on it.
 //
 // Read TIMESTAMP columns (mtime, created_at, last_seen) as CAST(col AS TEXT):
 // the driver otherwise parses them into time.Time and reformats them.
 package db
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -15,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const SchemaVersion = 7
+const SchemaVersion = 8
 
 // Querier is satisfied by *sql.DB and *sql.Tx, so helpers can run inside a caller's transaction.
 type Querier interface {
@@ -53,7 +54,7 @@ func Open(path string) (*DB, error) {
 	return &DB{DB: sdb, Path: path}, nil
 }
 
-const schema = `
+var schema = `
 CREATE TABLE schema_version (
     version INTEGER PRIMARY KEY,
     applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -79,19 +80,7 @@ CREATE TABLE file (
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(md5)
 );
-CREATE TABLE instance (
-    id INTEGER PRIMARY KEY,
-    file_id INTEGER NOT NULL,
-    dir_id INTEGER NOT NULL,
-    filename TEXT NOT NULL,
-    filename_lower TEXT NOT NULL,
-    mtime TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (file_id) REFERENCES file(id) ON DELETE CASCADE,
-    FOREIGN KEY (dir_id) REFERENCES dir(id) ON DELETE CASCADE,
-    UNIQUE(dir_id, filename)
-);
+` + instanceDDL("instance") + `
 CREATE TABLE tag (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -122,17 +111,40 @@ CREATE INDEX idx_file_sha256 ON file(sha256);
 CREATE INDEX idx_file_sha256_noexif_jpeg ON file(sha256_noexif_jpeg);
 CREATE INDEX idx_file_sha256_8kb ON file(sha256_8kb);
 CREATE INDEX idx_file_size ON file(filesize);
-CREATE INDEX idx_instance_dir_id ON instance(dir_id);
-CREATE INDEX idx_instance_filename ON instance(filename);
-CREATE INDEX idx_instance_filename_lower ON instance(filename_lower);
-CREATE INDEX idx_instance_file_id ON instance(file_id);
-CREATE INDEX idx_instance_mtime ON instance(mtime);
 CREATE INDEX idx_tag_name ON tag(name);
 CREATE INDEX idx_file_tag_tag_id ON file_tag(tag_id);
 CREATE INDEX idx_file_tag_instance_id ON file_tag(instance_id);
 CREATE INDEX idx_dir_tag_tag_id ON dir_tag(tag_id);
 CREATE INDEX idx_dir_tag_dir_id ON dir_tag(dir_id);
-` + ftsSchema + `INSERT INTO schema_version (version) VALUES (7);
+` + instanceIndexes + ftsSchema + `INSERT INTO schema_version (version) VALUES (8);
+`
+
+// instanceDDL is the instance table under the given name. file_id is NULL while
+// the file is not hashed yet (it is already listed and found by name); size is
+// the size seen at the last walk or hash, so listings never need the file row.
+func instanceDDL(name string) string {
+	return `CREATE TABLE ` + name + ` (
+    id INTEGER PRIMARY KEY,
+    file_id INTEGER,
+    dir_id INTEGER NOT NULL,
+    filename TEXT NOT NULL,
+    filename_lower TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    mtime TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (file_id) REFERENCES file(id) ON DELETE SET NULL,
+    FOREIGN KEY (dir_id) REFERENCES dir(id) ON DELETE CASCADE,
+    UNIQUE(dir_id, filename)
+);
+`
+}
+
+const instanceIndexes = `CREATE INDEX idx_instance_dir_id ON instance(dir_id);
+CREATE INDEX idx_instance_filename ON instance(filename);
+CREATE INDEX idx_instance_filename_lower ON instance(filename_lower);
+CREATE INDEX idx_instance_file_id ON instance(file_id);
+CREATE INDEX idx_instance_mtime ON instance(mtime);
 `
 
 // ftsSchema adds two external-content FTS5 indexes over instance.filename, kept
@@ -145,7 +157,8 @@ CREATE VIRTUAL TABLE instance_trigram USING fts5(filename, content='instance', c
     tokenize='trigram remove_diacritics 0', detail=none, columnsize=0);
 CREATE VIRTUAL TABLE instance_words USING fts5(filename, content='instance', content_rowid='id',
     tokenize='unicode61 remove_diacritics 2');
-CREATE TRIGGER instance_fts_ai AFTER INSERT ON instance BEGIN
+` + ftsTriggers
+const ftsTriggers = `CREATE TRIGGER instance_fts_ai AFTER INSERT ON instance BEGIN
     INSERT INTO instance_trigram(rowid, filename) VALUES (new.id, new.filename);
     INSERT INTO instance_words(rowid, filename) VALUES (new.id, new.filename);
 END;
@@ -168,9 +181,49 @@ INSERT INTO instance_words(instance_words) VALUES ('rebuild');
 INSERT INTO schema_version (version) VALUES (7);
 `
 
-// Init switches to WAL, then checks the schema version, migrates a v6 DB
+// migrateV7 rebuilds instance for schema v8 (SQLite cannot drop NOT NULL in
+// place): file_id becomes nullable and size is copied from the file row. Ids are
+// kept, so file_tag rows and the external-content FTS indexes stay valid and
+// need no rebuild. It runs on one connection with foreign keys off, because
+// dropping instance would otherwise cascade into file_tag.
+func (d *DB) migrateV7() error {
+	ctx := context.Background()
+	conn, err := d.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = OFF"); err != nil {
+		return err
+	}
+	defer func() { _, _ = conn.ExecContext(ctx, "PRAGMA foreign_keys = ON") }() // the connection returns to the pool
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(instanceDDL("instance_new") + `
+INSERT INTO instance_new (id, file_id, dir_id, filename, filename_lower, size, mtime, created_at, last_seen)
+SELECT i.id, i.file_id, i.dir_id, i.filename, i.filename_lower, f.filesize, i.mtime, i.created_at, i.last_seen
+FROM instance i JOIN file f ON f.id = i.file_id;
+DROP TABLE instance;
+ALTER TABLE instance_new RENAME TO instance;
+` + instanceIndexes + ftsTriggers + `INSERT INTO schema_version (version) VALUES (8);`); err != nil {
+		return err
+	}
+	var bad int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM pragma_foreign_key_check").Scan(&bad); err != nil {
+		return err
+	}
+	if bad > 0 {
+		return fmt.Errorf("Migration to schema v8 left %d foreign key violations", bad)
+	}
+	return tx.Commit()
+}
+
+// Init switches to WAL, then checks the schema version, migrates a v6 or v7 DB
 // (announced on w, since rebuilding the FTS indexes takes minutes on millions
-// of instances) or creates schema v7.
+// of instances) or creates schema v8.
 // It is the only place that changes the journal mode or creates tables.
 func (d *DB) Init(w io.Writer) error {
 	if _, err := d.Exec("PRAGMA journal_mode = WAL"); err != nil {
@@ -186,12 +239,19 @@ func (d *DB) Init(w io.Writer) error {
 		if err != nil {
 			return err
 		}
+		if v.Valid && v.Int64 == 6 {
+			fmt.Fprintln(w, "Migrating database to schema v7 (full-text search)...")
+			if err := d.execTx(migrateV6); err != nil {
+				return err
+			}
+			v.Int64 = 7
+		}
 		switch {
 		case v.Valid && v.Int64 == SchemaVersion:
 			return nil
-		case v.Valid && v.Int64 == 6:
-			fmt.Fprintln(w, "Migrating database to schema v7 (full-text search)...")
-			ddl = migrateV6
+		case v.Valid && v.Int64 == 7:
+			fmt.Fprintln(w, "Migrating database to schema v8 (files indexed before hashing)...")
+			return d.migrateV7()
 		default:
 			found := "None"
 			if v.Valid {
@@ -200,6 +260,10 @@ func (d *DB) Init(w io.Writer) error {
 			return fmt.Errorf("Database schema version mismatch: expected %d, found %s", SchemaVersion, found)
 		}
 	}
+	return d.execTx(ddl)
+}
+
+func (d *DB) execTx(ddl string) error {
 	tx, err := d.Begin()
 	if err != nil {
 		return err
@@ -252,6 +316,7 @@ func (d *DB) RequireSchema() error {
 
 type Stats struct {
 	Dirs, Files, Instances, TotalSize, DuplicateFiles, DBSize int64
+	Unhashed                                                  int64 // instances waiting to be hashed
 }
 
 func (d *DB) Stats() (Stats, error) {
@@ -263,6 +328,7 @@ func (d *DB) Stats() (Stats, error) {
 		{"SELECT COUNT(*) FROM dir", &s.Dirs},
 		{"SELECT COUNT(*) FROM file", &s.Files},
 		{"SELECT COUNT(*) FROM instance", &s.Instances},
+		{"SELECT COUNT(*) FROM instance WHERE file_id IS NULL", &s.Unhashed},
 		{"SELECT COALESCE(SUM(filesize), 0) FROM file", &s.TotalSize},
 		{"SELECT COUNT(*) FROM file f WHERE f.filesize > 0 AND (SELECT COUNT(*) FROM instance i WHERE i.file_id = f.id) > 1", &s.DuplicateFiles},
 	} {
@@ -286,7 +352,7 @@ func (d *DB) Vacuum() error {
 
 // DeleteOrphanedFiles deletes every file row no instance references, across the whole DB.
 func (d *DB) DeleteOrphanedFiles() (int64, error) {
-	res, err := d.Exec("DELETE FROM file WHERE id NOT IN (SELECT DISTINCT file_id FROM instance)")
+	res, err := d.Exec("DELETE FROM file WHERE NOT EXISTS (SELECT 1 FROM instance WHERE file_id = file.id)")
 	if err != nil {
 		return 0, err
 	}

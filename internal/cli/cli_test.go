@@ -84,11 +84,11 @@ func TestUsageErrorsExit2(t *testing.T) {
 func TestInitSchemaVersionMismatch(t *testing.T) {
 	h := newHarness(t)
 	d := dbtest.Init(t, h.dbPath())
-	if _, err := d.Exec("INSERT INTO schema_version (version) VALUES (8)"); err != nil {
+	if _, err := d.Exec("INSERT INTO schema_version (version) VALUES (9)"); err != nil {
 		t.Fatal(err)
 	}
 	code, _, errOut := h.run("init")
-	if code != 1 || errOut != "Error: Database schema version mismatch: expected 7, found 8\n" {
+	if code != 1 || errOut != "Error: Database schema version mismatch: expected 8, found 9\n" {
 		t.Fatalf("exit %d, stderr %q", code, errOut)
 	}
 }

@@ -9,7 +9,7 @@ A unique piece of content, identified by its hashes and size. Many locations can
 _Avoid_: blob, content
 
 **Instance**:
-One location of a File: a filename inside a Dir.
+One location of a File: a filename inside a Dir. It records the size and mtime seen at the last walk or hash. An Instance is **unhashed** (no File yet) from the moment the walk finds it until it is hashed; it is findable by name meanwhile. A scan runs in this order: walk (index), prune, hash.
 _Avoid_: copy, path entry
 
 **Dir**:
@@ -23,7 +23,7 @@ A File that has more than one Instance.
 
 ## Relationships
 
-- A **File** has one or more **Instances**
+- A **File** has one or more hashed **Instances**; an unhashed **Instance** has no **File**
 - An **Instance** lives in exactly one **Dir**
 - A **Dir** has zero or one parent **Dir**
 - A **Tag** attaches to **Instances** and **Dirs**, not to **Files**

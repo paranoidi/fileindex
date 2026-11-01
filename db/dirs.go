@@ -179,6 +179,14 @@ func (d *DB) RecordDirs(paths []string) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err := recordDirs(tx, paths); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func recordDirs(tx Querier, paths []string) error {
+	var err error
 	ids := make(map[string]int64, len(paths))
 	for _, p := range paths {
 		var id int64
@@ -198,7 +206,7 @@ func (d *DB) RecordDirs(paths []string) error {
 		}
 		ids[p] = id
 	}
-	return tx.Commit()
+	return nil
 }
 
 // deleteTree deletes the dir and everything under it, returning the instances

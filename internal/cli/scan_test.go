@@ -172,12 +172,15 @@ func TestScanMD5Collision(t *testing.T) {
 	writeFile(t, filepath.Join(tree, "a.jpg"), "a")
 	writeFile(t, filepath.Join(tree, "b.jpg"), "b")
 	// pretend another file shares a.jpg's md5
+	// held by an instance elsewhere, or the post-prune orphan sweep would drop it
 	d.Exec("INSERT INTO file (md5, sha256, filesize) VALUES ('0cc175b9c0f1b6a831c399e269772661', 'other', 1)")
+	other, _ := db.GetOrCreatePath(d, "/elsewhere")
+	d.Exec("INSERT INTO instance (file_id, dir_id, filename, filename_lower, size) SELECT id, ?, 'x', 'x', 1 FROM file WHERE sha256 = 'other'", *other)
 	code, out, errOut := h.run("scan", tree)
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, errOut)
 	}
-	wantLines(t, out, "Files processed: 1", "Files added: 1", "Files with errors: 1")
+	wantLines(t, out, "Files processed: 1", "Files added: 2", "Files with errors: 1")
 	if !strings.Contains(errOut, "md5 collision: "+filepath.Join(tree, "a.jpg")) {
 		t.Errorf("stderr: %s", errOut)
 	}

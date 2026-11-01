@@ -14,6 +14,7 @@ type Entry struct {
 	SHA256  string
 	MD5     string
 	IsJPEG  bool // has a sha256_noexif_jpeg
+	Hashed  bool // false while the instance waits to be hashed; the hash fields are then empty
 	Size    int64
 	Mtime   string // as stored, "" when NULL; Recorded{Size, Mtime}.Unchanged compares it with a file
 }
@@ -21,9 +22,9 @@ type Entry struct {
 // FilesUnder lists the instances directly in dir id, or in its whole tree with
 // recursive, sorted by path.
 func (d *DB) FilesUnder(id int64, recursive bool) ([]Entry, error) {
-	q := `SELECT i.dir_id, i.filename, COALESCE(f.sha256_noexif_jpeg, f.sha256), f.sha256, f.md5,
-f.sha256_noexif_jpeg IS NOT NULL, f.filesize, COALESCE(CAST(i.mtime AS TEXT), '')
-FROM instance i JOIN file f ON i.file_id = f.id `
+	q := `SELECT i.dir_id, i.filename, COALESCE(f.sha256_noexif_jpeg, f.sha256, ''), COALESCE(f.sha256, ''), COALESCE(f.md5, ''),
+COALESCE(f.sha256_noexif_jpeg IS NOT NULL, 0), i.size, COALESCE(CAST(i.mtime AS TEXT), ''), i.file_id IS NOT NULL
+FROM instance i LEFT JOIN file f ON i.file_id = f.id `
 	if recursive {
 		q = treeCTE + q + "WHERE i.dir_id IN (SELECT id FROM dir_tree)"
 	} else {
@@ -38,7 +39,7 @@ FROM instance i JOIN file f ON i.file_id = f.id `
 	for rows.Next() {
 		var e Entry
 		var dir int64
-		if err := rows.Scan(&dir, &e.Path, &e.Content, &e.SHA256, &e.MD5, &e.IsJPEG, &e.Size, &e.Mtime); err != nil {
+		if err := rows.Scan(&dir, &e.Path, &e.Content, &e.SHA256, &e.MD5, &e.IsJPEG, &e.Size, &e.Mtime, &e.Hashed); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -67,7 +68,7 @@ type DupGroup struct {
 	Locations []string
 }
 
-// Duplicates returns content groups with 2+ instances, biggest first. With a
+// Duplicates ignores unhashed instances. It returns content groups with 2+ instances, biggest first. With a
 // filter (a dir tree's ids), a group is kept if any instance is inside it, or
 // with within, only if all are. Instances are read as rows, so names with
 // "; " are safe.
@@ -159,7 +160,8 @@ WHERE COALESCE(f.sha256_noexif_jpeg, f.sha256) IN (SELECT h FROM grp)`)
 
 // FileRecord is what the index holds for one instance.
 type FileRecord struct {
-	MD5, SHA256 string
+	MD5, SHA256 string // empty while Hashed is false
+	Hashed      bool
 	Mtime       string // as stored, empty if unset
 	Size        int64
 }
@@ -171,8 +173,9 @@ func (d *DB) FileInfo(path string) (FileRecord, bool, error) {
 	if err != nil || !found {
 		return r, false, err
 	}
-	err = d.QueryRow(`SELECT f.md5, f.sha256, f.filesize, COALESCE(CAST(i.mtime AS TEXT), '') FROM instance i JOIN file f ON i.file_id = f.id
-WHERE i.dir_id = ? AND i.filename = ?`, *dirID, filepath.Base(path)).Scan(&r.MD5, &r.SHA256, &r.Size, &r.Mtime)
+	err = d.QueryRow(`SELECT COALESCE(f.md5, ''), COALESCE(f.sha256, ''), i.file_id IS NOT NULL, i.size, COALESCE(CAST(i.mtime AS TEXT), '')
+FROM instance i LEFT JOIN file f ON i.file_id = f.id
+WHERE i.dir_id = ? AND i.filename = ?`, *dirID, filepath.Base(path)).Scan(&r.MD5, &r.SHA256, &r.Hashed, &r.Size, &r.Mtime)
 	if err == sql.ErrNoRows {
 		return r, false, nil
 	}

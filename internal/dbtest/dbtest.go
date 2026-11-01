@@ -61,8 +61,8 @@ func AddFile(t testing.TB, d *db.DB, p, content string) int64 {
 		fileID, _ = res.LastInsertId()
 	}
 	name := path.Base(p)
-	res, err := d.Exec("INSERT INTO instance (file_id, dir_id, filename, filename_lower, mtime) VALUES (?, ?, ?, ?, ?)",
-		fileID, dirID, name, db.Lower(name), Mtime)
+	res, err := d.Exec("INSERT INTO instance (file_id, dir_id, filename, filename_lower, size, mtime) VALUES (?, ?, ?, ?, ?, ?)",
+		fileID, dirID, name, db.Lower(name), len(content), Mtime)
 	if err != nil {
 		t.Fatal(err)
 	}

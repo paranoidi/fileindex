@@ -285,34 +285,28 @@ func TestRunReportsRootsDone(t *testing.T) {
 	}
 }
 
-// commitCounter counts committed instances each time a root is reported done.
-type commitCounter struct {
+// indexCounter counts discovery commits.
+type indexCounter struct {
 	recorder
-	d    *db.DB
-	seen []int
+	indexed []int
 }
 
-func (c *commitCounter) RootDone(int) {
-	var n int
-	_ = c.d.QueryRow("SELECT COUNT(*) FROM instance").Scan(&n)
-	c.mu.Lock()
-	c.seen = append(c.seen, n)
-	c.mu.Unlock()
-}
+func (c *indexCounter) Indexed(n int)          { c.indexed = append(c.indexed, n) }
+func (c *indexCounter) Discovered(scan.Stats)  {}
+func (c *indexCounter) Pruned(scan.Stats, int) {}
 
-// BatchInterval replaces the file count: with a long interval every file lands
-// in the final commit, so every root is reported done with all of them stored.
+// BatchInterval replaces the file count: with a long interval a root's files
+// land in one commit however small BatchFiles is.
 func TestRunBatchIntervalReplacesFileCount(t *testing.T) {
 	d, tree := newIndex(t)
-	write(t, tree, "harbor/anchor", "harbor/rope", "meadow/clover")
-	rec := &commitCounter{d: d}
+	write(t, tree, "harbor/anchor", "harbor/rope", "harbor/sail")
+	rec := &indexCounter{}
 	opt := scan.Options{MissingOnly: true, Workers: 1, BatchFiles: 1, BatchInterval: time.Hour}
-	args := []string{filepath.Join(tree, "harbor"), filepath.Join(tree, "meadow")}
-	if _, err := scan.Run(context.Background(), d, args, opt, rec); err != nil {
+	if _, err := scan.Run(context.Background(), d, []string{tree}, opt, rec); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(rec.seen, []int{3, 3}) {
-		t.Fatalf("instances stored at each RootDone = %v, want [3 3]", rec.seen)
+	if !slices.Equal(rec.indexed, []int{3}) {
+		t.Fatalf("Indexed = %v, want [3]", rec.indexed)
 	}
 }
 

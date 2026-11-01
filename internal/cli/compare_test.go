@@ -80,7 +80,7 @@ func TestDuplicatesRowsAndWaste(t *testing.T) {
 	for i, size := range []int64{100, 150} {
 		r, _ := d.Exec("INSERT INTO file (md5, sha256, sha256_noexif_jpeg, filesize) VALUES (?, ?, 'img', ?)", i, i, size)
 		id, _ := r.LastInsertId()
-		d.Exec("INSERT INTO instance (file_id, dir_id, filename, filename_lower) VALUES (?, ?, ?, ?)", id, *dir, string(rune('a'+i))+".jpg", string(rune('a'+i))+".jpg")
+		d.Exec("INSERT INTO instance (file_id, dir_id, filename, filename_lower, size) VALUES (?, ?, ?, ?, ?)", id, *dir, string(rune('a'+i))+".jpg", string(rune('a'+i))+".jpg", size)
 	}
 	out := h.mustRun("duplicates")
 	if !strings.Contains(out, "     /m/a;b; c.jpg\n     /m/plain.jpg\n") {

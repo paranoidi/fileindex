@@ -101,7 +101,7 @@ func TestFindOutdatedSchema(t *testing.T) {
 	if _, err := d.Exec("INSERT INTO schema_version (version) VALUES (6)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.Exec("DELETE FROM schema_version WHERE version = 7"); err != nil {
+	if _, err := d.Exec("DELETE FROM schema_version WHERE version = 8"); err != nil {
 		t.Fatal(err)
 	}
 	if code, _, errOut := h.run("find", "*", "/m"); code != 1 || !strings.Contains(errOut, "run `fileindex init` to upgrade") {

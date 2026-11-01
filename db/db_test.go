@@ -581,3 +581,140 @@ func TestFilesUnderMtime(t *testing.T) {
 		t.Fatalf("FilesUnder = %+v, %v", got, err)
 	}
 }
+
+// v7DDL is the part of schema v7 that migration to v8 touches or must keep.
+const v7DDL = `
+CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE dir (id INTEGER PRIMARY KEY, parent_id INTEGER, name TEXT NOT NULL, name_lower TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (parent_id) REFERENCES dir(id) ON DELETE CASCADE, UNIQUE(parent_id, name));
+CREATE TABLE file (id INTEGER PRIMARY KEY, md5 TEXT NOT NULL, sha256 TEXT NOT NULL, sha256_noexif_jpeg TEXT,
+    sha256_8kb TEXT, filesize INTEGER NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(md5));
+CREATE TABLE instance (id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL, dir_id INTEGER NOT NULL,
+    filename TEXT NOT NULL, filename_lower TEXT NOT NULL, mtime TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (file_id) REFERENCES file(id) ON DELETE CASCADE,
+    FOREIGN KEY (dir_id) REFERENCES dir(id) ON DELETE CASCADE, UNIQUE(dir_id, filename));
+CREATE TABLE tag (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE file_tag (tag_id INTEGER NOT NULL, instance_id INTEGER NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (tag_id) REFERENCES tag(id) ON DELETE CASCADE,
+    FOREIGN KEY (instance_id) REFERENCES instance(id) ON DELETE CASCADE, UNIQUE(tag_id, instance_id));
+CREATE TABLE dir_tag (tag_id INTEGER NOT NULL, dir_id INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (tag_id) REFERENCES tag(id) ON DELETE CASCADE,
+    FOREIGN KEY (dir_id) REFERENCES dir(id) ON DELETE CASCADE, UNIQUE(tag_id, dir_id));
+CREATE VIRTUAL TABLE instance_trigram USING fts5(filename, content='instance', content_rowid='id',
+    tokenize='trigram remove_diacritics 0', detail=none, columnsize=0);
+CREATE VIRTUAL TABLE instance_words USING fts5(filename, content='instance', content_rowid='id',
+    tokenize='unicode61 remove_diacritics 2');
+CREATE TRIGGER instance_fts_ai AFTER INSERT ON instance BEGIN
+    INSERT INTO instance_trigram(rowid, filename) VALUES (new.id, new.filename);
+    INSERT INTO instance_words(rowid, filename) VALUES (new.id, new.filename);
+END;
+CREATE TRIGGER instance_fts_ad AFTER DELETE ON instance BEGIN
+    INSERT INTO instance_trigram(instance_trigram, rowid, filename) VALUES ('delete', old.id, old.filename);
+    INSERT INTO instance_words(instance_words, rowid, filename) VALUES ('delete', old.id, old.filename);
+END;
+CREATE TRIGGER instance_fts_au AFTER UPDATE OF filename ON instance BEGIN
+    INSERT INTO instance_trigram(instance_trigram, rowid, filename) VALUES ('delete', old.id, old.filename);
+    INSERT INTO instance_words(instance_words, rowid, filename) VALUES ('delete', old.id, old.filename);
+    INSERT INTO instance_trigram(rowid, filename) VALUES (new.id, new.filename);
+    INSERT INTO instance_words(rowid, filename) VALUES (new.id, new.filename);
+END;
+INSERT INTO schema_version (version) VALUES (7);
+INSERT INTO dir (id, parent_id, name, name_lower) VALUES (1, NULL, '/', '/'), (2, 1, 'orchard', 'orchard');
+INSERT INTO file (id, md5, sha256, filesize) VALUES (1, 'm1', 's1', 111), (2, 'm2', 's2', 222);
+INSERT INTO instance (id, file_id, dir_id, filename, filename_lower, mtime) VALUES
+    (5, 1, 2, 'Lantern.txt', 'lantern.txt', '2024-01-02 03:04:05'), (9, 2, 2, 'meadow.txt', 'meadow.txt', NULL);
+INSERT INTO tag (id, name) VALUES (1, 'amber');
+INSERT INTO file_tag (tag_id, instance_id) VALUES (1, 9);
+INSERT INTO instance_trigram(instance_trigram) VALUES ('rebuild');
+INSERT INTO instance_words(instance_words) VALUES ('rebuild');
+`
+
+// Migration to v8 keeps instance ids, tags and FTS, and takes size from the file row.
+func TestMigrateV7(t *testing.T) {
+	paths := pathsOf(t)
+	d, err := db.Open(filepath.Join(t.TempDir(), "index.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	if _, err := d.Exec(v7DDL); err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	if err := d.Init(&out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "schema v8") {
+		t.Errorf("no migration notice: %q", out.String())
+	}
+	if err := d.RequireSchema(); err != nil {
+		t.Fatal(err)
+	}
+	var sizes string
+	if err := d.QueryRow("SELECT group_concat(id || ':' || size || ':' || file_id, ' ') FROM (SELECT * FROM instance ORDER BY id)").Scan(&sizes); err != nil || sizes != "5:111:1 9:222:2" {
+		t.Errorf("instances = %q, %v", sizes, err)
+	}
+	var tagged int
+	if err := d.QueryRow("SELECT COUNT(*) FROM file_tag WHERE instance_id = 9").Scan(&tagged); err != nil || tagged != 1 {
+		t.Errorf("file_tag rows = %d, %v", tagged, err)
+	}
+	ftsIntegrity(t, d, "migration")
+	root, _, _ := db.DirByPath(d, "/orchard")
+	if got := paths(d.FindByWords("lantern", *root)); got != "/orchard/Lantern.txt" {
+		t.Errorf("words after migration: %q", got)
+	}
+	if got := paths(d.FindByName("*eado*", *root, true, false)); got != "/orchard/meadow.txt" {
+		t.Errorf("trigram after migration: %q", got)
+	}
+	// file_id is nullable now, and the triggers survived
+	if _, err := d.Exec("INSERT INTO instance (dir_id, filename, filename_lower, size) VALUES (2, 'orchid.txt', 'orchid.txt', 3)"); err != nil {
+		t.Fatal(err)
+	}
+	ftsIntegrity(t, d, "insert after migration")
+	if got := paths(d.FindByWords("orchid", *root)); got != "/orchard/orchid.txt" {
+		t.Errorf("words after insert: %q", got)
+	}
+}
+
+// Unhashed instances are listed, never counted as duplicates, and removable.
+func TestUnhashedInstances(t *testing.T) {
+	d := dbtest.New(t)
+	dbtest.AddFile(t, d, "/m/a.bin", "same")
+	dbtest.AddFile(t, d, "/m/b.bin", "same")
+	if _, err := d.CommitDiscovered([]db.DiscoveredFile{{Dir: "/m", Name: "c.bin", Size: 4, Mtime: time.Unix(1700000000, 0)}}, []string{"/m"}); err != nil {
+		t.Fatal(err)
+	}
+	id, _, _ := db.DirByPath(d, "/m")
+	files, _, err := d.ListDir(*id)
+	if err != nil || len(files) != 3 || files[2].Name != "c.bin" || files[2].Hashed || !files[0].Hashed || files[2].Size != 4 {
+		t.Fatalf("ListDir = %+v, %v", files, err)
+	}
+	entries, err := d.FilesUnder(*id, false)
+	if err != nil || len(entries) != 3 || entries[2].Hashed || entries[2].Content != "" {
+		t.Fatalf("FilesUnder = %+v, %v", entries, err)
+	}
+	groups, err := d.Duplicates(nil, false)
+	if err != nil || len(groups) != 1 || len(groups[0].Locations) != 2 {
+		t.Fatalf("Duplicates = %+v, %v", groups, err)
+	}
+	if n, err := d.CountUnhashed("/m"); err != nil || n != 1 {
+		t.Errorf("CountUnhashed = %d, %v", n, err)
+	}
+	if rm, err := d.RemoveInstance("/m/c.bin"); err != nil || rm.Instances != 1 || rm.Files != 0 {
+		t.Errorf("RemoveInstance = %+v, %v", rm, err)
+	}
+	// the orphan sweep must not choke on NULL file_ids
+	if _, err := d.CommitDiscovered([]db.DiscoveredFile{{Dir: "/m", Name: "d.bin", Size: 1, Mtime: time.Unix(1700000000, 0)}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec("DELETE FROM instance WHERE filename IN ('a.bin', 'b.bin')"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := d.DeleteOrphanedFiles(); err != nil || n != 1 {
+		t.Errorf("DeleteOrphanedFiles = %d, %v", n, err)
+	}
+}

@@ -3,10 +3,10 @@ package scan
 import (
 	"context"
 	"fmt"
-	"iter"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/paranoidi/fileindex/db"
@@ -23,7 +23,8 @@ const (
 type Options struct {
 	Rules       Rules
 	Workers     int  // hash workers; 0 = auto-scale
-	MissingOnly bool // skip files indexed with the same size and mtime (the CLI's default; --all turns it off)
+	MissingOnly bool // skip files indexed and hashed with the same size and mtime (the CLI's default; --all turns it off)
+	SkipHash    bool // index and prune only: new and changed files stay unhashed, findable by name, until a later run hashes them
 	BatchFiles  int  // files per commit; 0 = 1000. Smaller batches make a cancel land sooner.
 	// BatchInterval, when > 0, commits a batch once this long has passed since its
 	// first file instead of after BatchFiles files. Every commit flushes the
@@ -37,14 +38,36 @@ type Reporter interface {
 	Worker(id int, path string)                      // hash worker id (1..N) started on path
 	Speed(workers int, bps float64)                  // hashing speed and worker count, every tick
 	Scan(dir string, scanned, newFiles, skipped int) // discovery progress; dir "" = done
-	Hashed(res Stats)                                // hashing done and committed; pruning follows unless res.Interrupted
+	Hashed(res Stats)                                // last call: hashing done and committed, or skipped or cut short (res.Interrupted)
 	Prune(dir string, checked int)                   // pruning progress
 	Log(msg string)                                  // a removal made by pruning
 }
 
+// PhaseReporter is an optional extension of Reporter: a Reporter that also
+// implements it can tell Run's three stages apart. The calls, in order:
+// Scan and Indexed while walking, Discovered, Prune and Log while pruning,
+// Pruned, Worker and Speed while hashing, then Hashed.
+type PhaseReporter interface {
+	// Indexed is called after each discovery commit with the number of files
+	// committed so far in this run. They are findable by name from then on,
+	// still unhashed.
+	Indexed(committed int)
+	// Discovered is called once the walk and its commits are done (also when
+	// cancelled). Pruning follows unless res.Interrupted.
+	Discovered(res Stats)
+	// Pruned is called once pruning is done and not interrupted. toHash is the
+	// number of unhashed instances under the roots after pruning, including ones
+	// left by earlier runs: the total for hashing progress (an upper bound when
+	// roots nest). Hashing follows unless Options.SkipHash.
+	Pruned(res Stats, toHash int)
+}
+
 // Stats is what Run did. Errors are per-file problems that didn't stop it.
+// Added and Updated count instances written by discovery, Processed and
+// TotalSize the files hashed.
 type Stats struct {
 	Processed, Added, Updated, Skipped, Errored int
+	Discovered                                  int // files committed by discovery (Added + Updated)
 	TotalSize                                   int64
 	PrunedFiles, PrunedDirs                     int64
 	Errors                                      []string
@@ -67,11 +90,27 @@ func ResolveRoots(args []string) ([]string, error) {
 	return roots, nil
 }
 
-// Run scans roots into d: it hashes new and changed files (committing batches
-// in the background), records every dir it walked (empty ones too), then prunes
-// records under each root that are gone from disk and deletes orphaned file rows. Cancelling ctx stops it between
-// files or pruned dirs; Run then returns with Interrupted set once the commit
-// in flight has finished. It holds no package state and handles no signals.
+// Run scans roots into d in two phases. Phase 1 walks the roots and commits
+// new and changed files as unhashed instances (size, mtime, no file_id) in
+// batches while it walks, so they are findable by name at once; dirs are
+// recorded in the same batches (empty ones too). Then it prunes records under
+// each root that are gone from disk and deletes orphaned file rows, so stale
+// names leave the index before any hashing. Phase 2 hashes every unhashed
+// instance under the roots, including ones left by an interrupted or SkipHash
+// run, and commits batches in the background. SkipHash stops after pruning.
+// A cancel in any stage skips the later ones.
+//
+// A file that changes between the walk and hashing is stored with the size and
+// mtime it was hashed at, so hashes always match the instance. A file that
+// cannot be hashed stays unhashed and is retried by the next run.
+//
+// Memory is bounded whatever the tree size: the walk streams into one batch
+// (plus one dir's records for the skip check) and hashing pages through
+// unhashed instances by id, one page at a time; nothing collects the file list.
+//
+// Cancelling ctx stops it between files or pruned dirs; Run then returns with
+// Interrupted set once the commit in flight has finished. It holds no package
+// state and handles no signals.
 func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) (Stats, error) {
 	var res Stats
 	if opt.Workers < 0 {
@@ -94,17 +133,244 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 		maxFiles = batchFiles
 	}
 
-	var discoverErr error
-	var dirs []string // every dir walked, for RecordDirs; filled by discover
-	rt := newRootTracker(r, len(roots))
-	paths := discover(ctx, d, opt.Rules, roots, opt.MissingOnly, r, rt, &res, &dirs, &discoverErr)
-	if opt.MissingOnly {
-		// Discover fully before hashing, so -m's reads don't interleave with batch writes.
-		paths = slices.Values(slices.Collect(paths))
+	scopes, err := discover(ctx, d, opt, maxFiles, roots, r, &res)
+	if err != nil {
+		return res, err
+	}
+	res.Interrupted = ctx.Err() != nil
+	pr, _ := r.(PhaseReporter)
+	if pr != nil {
+		pr.Discovered(res)
+	}
+	if !res.Interrupted {
+		if err := pruneRoots(ctx, d, roots, r, &res); err != nil {
+			return res, err
+		}
+	}
+	if !res.Interrupted {
+		toHash := 0 // counted after pruning, so pruned rows are not in it
+		for _, sc := range scopes {
+			n, err := d.CountUnhashed(sc)
+			if err != nil {
+				return res, err
+			}
+			toHash += n
+		}
+		if pr != nil {
+			pr.Pruned(res, toHash)
+		}
+		if !opt.SkipHash {
+			if err := hashPending(ctx, d, opt, maxFiles, scopes, r, &res); err != nil {
+				return res, err
+			}
+			// hashing re-attaches or replaces file rows: drop what lost its last instance
+			if _, err := d.DeleteOrphanedFiles(); err != nil {
+				return res, err
+			}
+		}
+	}
+	r.Hashed(res)
+	return res, nil
+}
+
+// pruneRoots prunes the records under each root that are gone from disk, then
+// deletes orphaned file rows (also after a cancel, which keeps the DB tidy).
+func pruneRoots(ctx context.Context, d *db.DB, roots []string, r Reporter, res *Stats) error {
+	for _, root := range roots {
+		id, found, err := db.DirByPath(d, root)
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue // a scanned file, not a dir
+		}
+		f, n, err := d.PruneDir(ctx, root, *id, r.Prune, r.Log)
+		res.PrunedFiles += f
+		res.PrunedDirs += n
+		if ctx.Err() != nil {
+			res.Interrupted = true
+			break // PruneDir committed its work
+		}
+		if err != nil {
+			return err
+		}
+	}
+	_, err := d.DeleteOrphanedFiles()
+	return err
+}
+
+// discover is phase 1. It walks the roots and commits each batch (synchronously,
+// so the skip check's reads never interleave with a background write) of
+// files that are new or differ from their record, plus the dirs entered.
+// With MissingOnly, a file recorded with the same size and mtime is skipped;
+// an unhashed one is left as is for phase 2. RootDone fires for a root once its
+// files are committed. It returns the paths phase 2 selects unhashed instances
+// under: the roots, and dirs reached through symlinks outside them, where the
+// index stores their files.
+func discover(ctx context.Context, d *db.DB, opt Options, maxFiles int, roots []string, r Reporter, res *Stats) ([]string, error) {
+	rr, _ := r.(RootReporter)
+	pr, _ := r.(PhaseReporter)
+	isOwn := ownFiles(d.Path)
+	scopes := slices.Clone(roots)
+	var batch []db.DiscoveredFile
+	var dirs []string
+	var batchStart time.Time
+	var werr error
+	committed, scanned, found := 0, 0, 0
+
+	flush := func() error {
+		if len(batch) == 0 && len(dirs) == 0 {
+			return nil
+		}
+		br, err := d.CommitDiscovered(batch, dirs)
+		if err != nil {
+			return err
+		}
+		res.Added += br.Added
+		res.Updated += br.Updated
+		committed += len(batch)
+		res.Discovered = committed
+		batch, dirs = batch[:0], dirs[:0]
+		if pr != nil {
+			pr.Indexed(committed)
+		}
+		return nil
+	}
+	// added is called after an item joined the batch.
+	added := func() {
+		if len(batch)+len(dirs) == 1 {
+			batchStart = time.Now()
+		}
+		full := len(batch)+len(dirs) >= maxFiles
+		if opt.BatchInterval > 0 {
+			full = time.Since(batchStart) >= opt.BatchInterval
+		}
+		if full && werr == nil {
+			werr = flush()
+		}
+	}
+	onDir := func(dir string) {
+		real, err := db.Resolve(dir)
+		if werr != nil || err != nil {
+			return
+		}
+		dirs = append(dirs, real)
+		added()
+		if !slices.ContainsFunc(scopes, func(s string) bool { return within(s, real) }) {
+			scopes = append(scopes, real) // reached through a symlink
+		}
 	}
 
-	// A batch commits in the background while the next one is hashed; otherwise
-	// every commit stalls all workers, which shows with many small files.
+	// Walk yields a dir's files together, so the last dir's records are all we keep.
+	lastDir, recorded := "", map[string]db.Recorded(nil)
+walk:
+	for i, root := range roots {
+		for p := range opt.Rules.WalkDirs(root, onDir) {
+			if ctx.Err() != nil || werr != nil {
+				break walk
+			}
+			scanned++
+			dir := filepath.Dir(p)
+			if isOwn(p) {
+				Logger.Debug("Skipping the index database: " + p)
+				res.Skipped++
+				continue
+			}
+			fi, err := os.Stat(p)
+			if err == nil && !fi.Mode().IsRegular() {
+				err = fmt.Errorf("Path is not a regular file: %s", p)
+			}
+			realDir := ""
+			if err == nil {
+				realDir, err = db.Resolve(dir) // stored under the real path
+			}
+			if err != nil {
+				res.Errored++
+				res.Errors = append(res.Errors, fmt.Sprintf("Error processing file info for %s: %v", p, err))
+				continue
+			}
+			write := true
+			if opt.MissingOnly {
+				if realDir != lastDir {
+					lastDir = realDir
+					if recorded, werr = d.DirFiles(realDir); werr != nil {
+						break walk
+					}
+				}
+				if rec, ok := recorded[filepath.Base(p)]; ok && rec.Same(fi.Size(), fi.ModTime()) {
+					write = false // unchanged: nothing to write
+					if rec.Hashed {
+						res.Skipped++
+					} else {
+						found++ // waits for phase 2
+					}
+				} else {
+					found++
+				}
+			} else {
+				found++
+			}
+			r.Scan(dir, scanned, found, res.Skipped)
+			if write {
+				batch = append(batch, db.DiscoveredFile{Dir: realDir, Name: filepath.Base(p), Size: fi.Size(), Mtime: fi.ModTime()})
+				added()
+			}
+		}
+		if werr != nil || ctx.Err() != nil {
+			break
+		}
+		if err := flush(); err != nil {
+			werr = err
+			break
+		}
+		if rr != nil {
+			rr.RootDone(i)
+		}
+	}
+	// a cancelled walk still keeps what it found
+	if err := flush(); err != nil && werr == nil {
+		werr = err
+	}
+	r.Scan("", scanned, found, res.Skipped)
+	return scopes, werr
+}
+
+// within reports whether p is dir or inside it.
+func within(dir, p string) bool {
+	rel, err := filepath.Rel(dir, p)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, "../")
+}
+
+// hashPage is how many unhashed instances phase 2 loads at a time.
+const hashPage = 1000
+
+// hashPending is phase 2: it hashes the unhashed instances under scopes, paging
+// through them by id, and commits batches in the background while the next
+// one is hashed; otherwise every commit stalls all workers, which shows with
+// many small files.
+func hashPending(ctx context.Context, d *db.DB, opt Options, maxFiles int, scopes []string, r Reporter, res *Stats) error {
+	var pageErr error
+	paths := func(yield func(string) bool) {
+		for _, sc := range scopes {
+			for after := int64(0); ; {
+				page, err := d.UnhashedUnder(sc, after, hashPage)
+				if err != nil {
+					pageErr = err
+					return
+				}
+				if len(page) == 0 {
+					break
+				}
+				for _, u := range page {
+					after = u.ID
+					if ctx.Err() != nil || !yield(u.Path) {
+						return
+					}
+				}
+			}
+		}
+	}
+
 	type committed struct {
 		batch []db.ScannedFile
 		res   db.BatchResult
@@ -114,7 +380,6 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 	var batchSize int64
 	var batchStart time.Time    // when the batch being filled got its first file
 	var inflight chan committed // nil when no commit is running
-	batches := 0                // commits started; the batch being filled is number batches
 	wait := func() error {
 		if inflight == nil {
 			return nil
@@ -124,9 +389,6 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 		if c.err != nil {
 			return c.err
 		}
-		rt.commitDone(batches)
-		res.Added += c.res.Added
-		res.Updated += c.res.Updated
 		for i, ferr := range c.res.Failed {
 			res.Processed--
 			res.TotalSize -= c.batch[i].Size
@@ -145,7 +407,6 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 			ch <- committed{b, res, err}
 		}()
 		inflight, batch, batchSize = ch, nil, 0
-		batches++
 		return nil
 	}
 	// an error return must not leave a commit running against d
@@ -155,24 +416,15 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 		if h.Err != nil { // errors go to the list only, not the log too
 			res.Errored++
 			res.Errors = append(res.Errors, h.Err.Error())
-			rt.hashed(h.Path, -1)
-			continue
-		}
-		dir, err := db.Resolve(filepath.Dir(h.Path)) // stored under the real path
-		if err != nil {
-			res.Errored++
-			res.Errors = append(res.Errors, fmt.Sprintf("Error processing file info for %s: %v", h.Path, err))
-			rt.hashed(h.Path, -1)
 			continue
 		}
 		if len(batch) == 0 {
 			batchStart = time.Now()
 		}
 		batch = append(batch, db.ScannedFile{
-			Dir: dir, Name: filepath.Base(h.Path), Size: h.Size, Mtime: h.Mtime,
+			Dir: filepath.Dir(h.Path), Name: filepath.Base(h.Path), Size: h.Size, Mtime: h.Mtime,
 			MD5: h.Hashes.MD5, SHA256: h.Hashes.SHA256, SHA256_8KB: h.Hashes.SHA256_8KB, NoExifJPEG: h.Hashes.NoExifJPEG,
 		})
-		rt.hashed(h.Path, batches)
 		res.Processed++
 		res.TotalSize += h.Size
 		batchSize += h.Size
@@ -182,116 +434,18 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 		}
 		if full || batchSize >= batchBytes {
 			if err := commit(); err != nil {
-				return res, err
+				return err
 			}
 		}
 	}
 	res.Interrupted = ctx.Err() != nil
 	if err := commit(); err != nil {
-		return res, err
+		return err
 	}
 	if err := wait(); err != nil {
-		return res, err
+		return err
 	}
-	if discoverErr != nil {
-		return res, discoverErr
-	}
-	// dirs exist on disk even when the walk was cancelled part way
-	if err := d.RecordDirs(dirs); err != nil {
-		return res, err
-	}
-	r.Hashed(res)
-	// Checked after Hashed so a cancel landing during commit/wait isn't lost.
-	if res.Interrupted || ctx.Err() != nil {
-		res.Interrupted = true
-		return res, nil
-	}
-
-	for _, root := range roots {
-		id, found, err := db.DirByPath(d, root)
-		if err != nil {
-			return res, err
-		}
-		if !found {
-			continue // a scanned file, not a dir
-		}
-		f, n, err := d.PruneDir(ctx, root, *id, r.Prune, r.Log)
-		res.PrunedFiles += f
-		res.PrunedDirs += n
-		if ctx.Err() != nil {
-			res.Interrupted = true
-			break // PruneDir committed its work; cleaning up keeps the DB tidy
-		}
-		if err != nil {
-			return res, err
-		}
-	}
-	_, err = d.DeleteOrphanedFiles()
-	return res, err
-}
-
-// discover walks the roots, reporting every file and appending every dir to
-// dirs (resolved, as files are stored). With missingOnly it drops
-// files recorded at the same resolved dir+name with the same size and mtime,
-// counting them as skipped.
-func discover(ctx context.Context, d *db.DB, rules Rules, roots []string, missingOnly bool, r Reporter, rt *rootTracker, res *Stats, dirs *[]string, errOut *error) iter.Seq[string] {
-	return func(yield func(string) bool) {
-		scanned, found := 0, 0
-		isOwn := ownFiles(d.Path)
-		// Walk yields a dir's files together, so the last dir's records are all we keep.
-		lastDir, recorded := "", map[string]db.Recorded(nil)
-		for i, root := range roots {
-			onDir := func(dir string) {
-				if real, err := db.Resolve(dir); err == nil {
-					*dirs = append(*dirs, real)
-				}
-			}
-			for p := range rules.WalkDirs(root, onDir) {
-				// Missing-only collects discovery before HashAll runs, so a cancel must stop it here.
-				if ctx.Err() != nil {
-					return
-				}
-				scanned++
-				dir := filepath.Dir(p)
-				if isOwn(p) {
-					Logger.Debug("Skipping the index database: " + p)
-					res.Skipped++
-					continue
-				}
-				keep := true
-				if missingOnly {
-					if dir != lastDir {
-						lastDir, recorded = dir, nil
-						if real, err := db.Resolve(dir); err == nil {
-							if recorded, err = d.DirFiles(real); err != nil {
-								*errOut = err
-								return
-							}
-						}
-					}
-					if rec, ok := recorded[filepath.Base(p)]; ok {
-						if fi, err := os.Stat(p); err == nil {
-							keep = !rec.Unchanged(fi.Size(), fi.ModTime())
-						}
-					}
-					if keep {
-						found++
-					} else {
-						res.Skipped++
-					}
-				}
-				r.Scan(dir, scanned, found, res.Skipped)
-				if keep {
-					rt.yielded(i, p)
-					if !yield(p) {
-						return
-					}
-				}
-			}
-			rt.walked(i)
-		}
-		r.Scan("", scanned, found, res.Skipped)
-	}
+	return pageErr
 }
 
 // ownFiles reports whether a walked path is the database at dbPath or one of

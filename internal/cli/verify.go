@@ -90,6 +90,10 @@ func (a *app) verifyFile(d *db.DB, path string, quiet bool) error {
 		fmt.Fprintf(w, "\n✘ Size mismatch:\n  Expected: %s, Actual: %s\n", db.FormatSize(info.Size), db.FormatSize(fi.Size()))
 		return exitCode(1)
 	}
+	if !info.Hashed {
+		fmt.Fprintln(w, "\n✘ Not hashed yet; run scan to hash it")
+		return exitCode(1)
+	}
 	r := scan.HashFile(path)
 	if r.Err != nil {
 		fmt.Fprintf(w, "\n✘ Error calculating hashes: %v\n", r.Err)
@@ -144,6 +148,10 @@ func (a *app) verifyDir(d *db.DB, path string, recursive, quiet bool) error {
 		}
 		if fi.Size() != e.Size {
 			sizes = append(sizes, verifyIssue{e.Path, fmt.Sprintf("Expected: %s, Actual: %s", db.FormatSize(e.Size), db.FormatSize(fi.Size()))})
+			continue
+		}
+		if !e.Hashed {
+			failed = append(failed, verifyIssue{e.Path, "Not hashed yet; run scan to hash it"})
 			continue
 		}
 		r := scan.HashFile(e.Path)

@@ -16,7 +16,7 @@ import (
 var batchFiles int
 
 func scanCmd(a *app) *cobra.Command {
-	var quiet, all bool
+	var quiet, all, noHash bool
 	cmd := &cobra.Command{
 		Use:   "scan PATHS...",
 		Short: "Scan directories and index files",
@@ -26,26 +26,57 @@ func scanCmd(a *app) *cobra.Command {
 			if quiet { // quiet means no stdout at all
 				out = io.Discard
 			}
-			return a.scan(args, out, quiet, !all)
+			return a.scan(args, out, quiet, !all, noHash)
 		},
 	}
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Suppress progress output")
+	cmd.Flags().BoolVar(&noHash, "no-hash", false, "Only index names, sizes and mtimes; files stay unhashed (searchable by name) until a later scan hashes them")
 	cmd.Flags().BoolVarP(&all, "all", "a", false, "Re-hash every file, including ones already indexed with the same size and mtime")
 	return cmd
 }
 
-// scanReporter draws Run's progress on the terminal: the hashing block, then
-// after hashed swaps in the pruning one.
+// scanReporter draws Run's progress on the terminal, one block per stage in
+// Run's order: scanning, pruning, hashing. Each stage change swaps the block.
 type scanReporter struct {
 	*progress.Progress
-	out    io.Writer
-	hashed func(scan.Stats)
+	out         io.Writer
+	workers     int
+	skipHash    bool
+	elapsed     func() time.Duration
+	newProgress func(workers int) *progress.Progress
 }
 
-func (s *scanReporter) Hashed(st scan.Stats) { s.hashed(st) }
-func (s *scanReporter) Log(msg string)       { s.Print(s.out, []byte(msg+"\n")) }
+func (s *scanReporter) Log(msg string) { s.Print(s.out, []byte(msg+"\n")) }
+func (s *scanReporter) Indexed(int)    {}
 
-func (a *app) scan(args []string, out io.Writer, quiet, missingOnly bool) error {
+// Discovered ends the scanning stage; pruning follows unless interrupted.
+func (s *scanReporter) Discovered(st scan.Stats) {
+	s.Clear()
+	if st.Interrupted {
+		return
+	}
+	fmt.Fprintln(s.out, "\nPruning directories...")
+	s.Progress = s.newProgress(0)
+}
+
+// Pruned ends the pruning stage; hashing follows unless skipped.
+func (s *scanReporter) Pruned(_ scan.Stats, toHash int) {
+	s.Clear()
+	if s.skipHash || toHash == 0 {
+		return
+	}
+	fmt.Fprintf(s.out, "\nHashing %d file(s)...\n", toHash)
+	s.Progress = s.newProgress(max(s.workers, 1))
+	s.Hashing(toHash)
+}
+
+// Hashed is Run's last call: the summary.
+func (s *scanReporter) Hashed(st scan.Stats) {
+	s.Clear()
+	printScanStats(s.out, st, s.elapsed(), st.Interrupted)
+}
+
+func (a *app) scan(args []string, out io.Writer, quiet, missingOnly, skipHash bool) error {
 	rules, err := scan.RulesFromConfig(a.cfg)
 	if err != nil {
 		return err
@@ -70,26 +101,19 @@ func (a *app) scan(args []string, out io.Writer, quiet, missingOnly bool) error 
 	}
 
 	a.handlesInterrupt.Store(true)
-	rep := &scanReporter{Progress: progress.NewProgress(a.stdout, max(workers, 1), roots, quiet), out: out}
+	defer a.handlesInterrupt.Store(false)
+	start := time.Now()
+	rep := &scanReporter{
+		Progress: progress.NewProgress(a.stdout, 0, roots, quiet), out: out, workers: workers, skipHash: skipHash,
+		elapsed:     func() time.Duration { return time.Since(start) },
+		newProgress: func(w int) *progress.Progress { return progress.NewProgress(a.stdout, w, roots, quiet) },
+	}
 	prevLog := logPrint
-	logPrint = rep.Print
+	logPrint = func(w io.Writer, b []byte) { rep.Print(w, b) } // rep.Progress changes between stages
 	defer func() { logPrint = prevLog }()
 	fmt.Fprintf(out, "Scanning %d path(s)...\n", len(roots))
-	start := time.Now()
-	rep.hashed = func(st scan.Stats) {
-		rep.Clear()
-		printScanStats(out, st, time.Since(start), st.Interrupted)
-		// From here Ctrl-C exits outright, like the prune command.
-		// Checked after the store so a Ctrl-C landing during commit/wait isn't lost.
-		a.handlesInterrupt.Store(false)
-		if st.Interrupted || a.ctx.Err() != nil {
-			return // Run sees the cancel too and stops
-		}
-		fmt.Fprintln(out, "\nPruning directories...")
-		rep.Progress = progress.NewProgress(a.stdout, 0, roots, quiet)
-	}
 
-	st, err := scan.Run(a.ctx, d, roots, scan.Options{Rules: rules, Workers: workers, MissingOnly: missingOnly, BatchFiles: batchFiles}, rep)
+	st, err := scan.Run(a.ctx, d, roots, scan.Options{Rules: rules, Workers: workers, MissingOnly: missingOnly, SkipHash: skipHash, BatchFiles: batchFiles}, rep)
 	rep.Clear()
 	if err != nil {
 		return err

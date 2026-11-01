@@ -10,7 +10,7 @@ var ExportHeader = []string{"md5", "sha256", "sha256_noexif_jpeg", "sha256_8kb",
 	"file_created_at", "file_last_seen", "path", "filename", "mtime", "instance_created_at", "instance_last_seen"}
 
 // ExportRows calls fn with every instance as a row in ExportHeader order, sorted
-// by md5, dir id, filename. NULL is "". Timestamps are the stored text.
+// by md5, dir id, filename. Unhashed instances have no md5 and are left out. NULL is "". Timestamps are the stored text.
 func (d *DB) ExportRows(fn func([]string) error) error {
 	rows, err := d.Query(`SELECT f.md5, f.sha256, f.sha256_noexif_jpeg, f.sha256_8kb, f.filesize,
 CAST(f.created_at AS TEXT), CAST(f.last_seen AS TEXT), i.dir_id, i.filename, CAST(i.mtime AS TEXT),
@@ -120,13 +120,13 @@ func (d *DB) ImportBatch(rows []ImportRow) (files, instances int, err error) {
 		switch err {
 		case sql.ErrNoRows:
 			_, err = insertOmittingEmpty(tx, "instance",
-				[]string{"file_id", "dir_id", "filename", "filename_lower", "mtime"},
-				[]any{fileID, dirID, r.Filename, Lower(r.Filename), nullIfEmpty(r.Mtime)},
+				[]string{"file_id", "dir_id", "filename", "filename_lower", "size", "mtime"},
+				[]any{fileID, dirID, r.Filename, Lower(r.Filename), r.Size, nullIfEmpty(r.Mtime)},
 				map[string]string{"created_at": r.InstCreated, "last_seen": r.InstLastSeen})
 			instances++
 		case nil:
-			_, err = tx.Exec("UPDATE instance SET file_id = ?, mtime = ?, last_seen = COALESCE(?, last_seen) WHERE id = ?",
-				fileID, nullIfEmpty(r.Mtime), nullIfEmpty(r.InstLastSeen), instID)
+			_, err = tx.Exec("UPDATE instance SET file_id = ?, size = ?, mtime = ?, last_seen = COALESCE(?, last_seen) WHERE id = ?",
+				fileID, r.Size, nullIfEmpty(r.Mtime), nullIfEmpty(r.InstLastSeen), instID)
 		}
 		if err != nil {
 			return 0, 0, err
