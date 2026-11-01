@@ -209,26 +209,38 @@ func TestDirs(t *testing.T) {
 	}
 }
 
-func TestDeleteOrphans(t *testing.T) {
+func TestDeleteOrphanedFiles(t *testing.T) {
 	d := dbtest.New(t)
-	db.GetOrCreatePath(d, "orphan1")
-	db.GetOrCreatePath(d, "orphan2/child")
-	keep := dbtest.AddFile(t, d, "/m/keep/x.jpg", "x")
+	dbtest.AddFile(t, d, "/m/keep/x.jpg", "x")
 	gone := dbtest.AddFile(t, d, "/m/gone/y.jpg", "y")
 	d.Exec("DELETE FROM instance WHERE id = ?", gone)
-
-	n, err := d.DeleteOrphanedDirs()
-	if err != nil || n != 4 { // orphan1, orphan2, child, gone
-		t.Errorf("DeleteOrphanedDirs = %d, %v", n, err)
-	}
-	if _, found, _ := db.DirByPath(d, "/m/keep"); !found {
-		t.Error("/m/keep was deleted")
-	}
-	n, err = d.DeleteOrphanedFiles()
+	n, err := d.DeleteOrphanedFiles()
 	if err != nil || n != 1 {
 		t.Errorf("DeleteOrphanedFiles = %d, %v", n, err)
 	}
-	_ = keep
+	if _, found, _ := db.DirByPath(d, "/m/gone"); !found {
+		t.Error("/m/gone was deleted with its file")
+	}
+}
+
+func TestRecordDirs(t *testing.T) {
+	d := dbtest.New(t)
+	if err := d.RecordDirs([]string{"/m", "/m/empty", "/m/empty/deeper", "/other/x"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"/m/empty/deeper", "/other/x"} {
+		if _, found, _ := db.DirByPath(d, p); !found {
+			t.Errorf("%s not recorded", p)
+		}
+	}
+	// recording again finds the same rows
+	before, _ := d.Stats()
+	if err := d.RecordDirs([]string{"/m", "/m/empty"}); err != nil {
+		t.Fatal(err)
+	}
+	if after, _ := d.Stats(); after.Dirs != before.Dirs {
+		t.Errorf("dirs %d -> %d", before.Dirs, after.Dirs)
+	}
 }
 
 func TestForeignKeysOn(t *testing.T) {
@@ -505,13 +517,13 @@ func TestRemoveInstance(t *testing.T) {
 		t.Errorf("shared: %+v, %v, files %d", r, err, count("file"))
 	}
 
-	// Orphaned file row and empty ancestors go; /m stays (still has other content).
+	// Orphaned file row goes; the dirs left empty stay (they are still on disk).
 	r, err = d.RemoveInstance("/m/hill/top/cloud.jpg")
-	if err != nil || r != (db.RemovedTree{Instances: 1, Files: 1, Dirs: 2}) {
+	if err != nil || r != (db.RemovedTree{Instances: 1, Files: 1}) {
 		t.Errorf("orphan: %+v, %v", r, err)
 	}
-	if dirExists("/m/hill") || dirExists("/m/hill/top") || !dirExists("/m") {
-		t.Error("wrong dirs after removing cloud.jpg")
+	if !dirExists("/m/hill/top") {
+		t.Error("/m/hill/top removed with cloud.jpg")
 	}
 
 	// Dir with another file or a subdir is kept.
@@ -520,7 +532,7 @@ func TestRemoveInstance(t *testing.T) {
 		t.Errorf("subdir kept: %+v, %v", r, err)
 	}
 	r, err = d.RemoveInstance("/m/meadow/clover-copy.jpg")
-	if err != nil || r.Files != 1 || r.Dirs != 1 || dirExists("/m/meadow") {
+	if err != nil || r.Files != 1 || r.Dirs != 0 || !dirExists("/m/meadow") {
 		t.Errorf("last copy: %+v, %v", r, err)
 	}
 

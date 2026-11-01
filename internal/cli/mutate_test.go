@@ -122,7 +122,7 @@ func TestMvFile(t *testing.T) {
 	writeFile(t, dst, "data")
 	dbtest.AddFile(t, d, src, "data")
 	out := h.mustRun("mv", src, dst)
-	if !strings.Contains(out, "File instances updated: 1\n  Orphaned directories cleaned up: 1\n") {
+	if !strings.Contains(out, "File instances updated: 1\n") {
 		t.Errorf("output %q", out)
 	}
 	if instanceDir(t, d, "renamed.txt") != dirID(t, d, filepath.Dir(dst)) {
@@ -204,7 +204,7 @@ func TestRemove(t *testing.T) {
 	dbtest.AddFile(t, d, "/test/subdir/deep/b.jpg", "b")
 	dbtest.AddFile(t, d, "/other/c.jpg", "c")
 	out := h.mustRun("remove", "/test/subdir")
-	want := "Removing all instances in directory tree: /test/subdir\nCleaning up orphaned file records\nCleaning up orphaned directories\n" +
+	want := "Removing all instances in directory tree: /test/subdir\nCleaning up orphaned file records\n" +
 		"\nRemoved from database:\n  Instances removed: 2\n  Files removed: 2\n  Directories removed: 3\n"
 	if out != want {
 		t.Errorf("got %q\nwant %q", out, want)

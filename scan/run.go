@@ -46,7 +46,7 @@ type Reporter interface {
 type Stats struct {
 	Processed, Added, Updated, Skipped, Errored int
 	TotalSize                                   int64
-	PrunedFiles, PrunedDirs, OrphanDirs         int64
+	PrunedFiles, PrunedDirs                     int64
 	Errors                                      []string
 	Interrupted                                 bool // ctx was cancelled; the DB holds every committed batch and no half-applied one
 }
@@ -68,8 +68,8 @@ func ResolveRoots(args []string) ([]string, error) {
 }
 
 // Run scans roots into d: it hashes new and changed files (committing batches
-// in the background), then prunes records under each root that are gone from
-// disk and deletes orphaned dir and file rows. Cancelling ctx stops it between
+// in the background), records every dir it walked (empty ones too), then prunes
+// records under each root that are gone from disk and deletes orphaned file rows. Cancelling ctx stops it between
 // files or pruned dirs; Run then returns with Interrupted set once the commit
 // in flight has finished. It holds no package state and handles no signals.
 func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) (Stats, error) {
@@ -95,8 +95,9 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 	}
 
 	var discoverErr error
+	var dirs []string // every dir walked, for RecordDirs; filled by discover
 	rt := newRootTracker(r, len(roots))
-	paths := discover(ctx, d, opt.Rules, roots, opt.MissingOnly, r, rt, &res, &discoverErr)
+	paths := discover(ctx, d, opt.Rules, roots, opt.MissingOnly, r, rt, &res, &dirs, &discoverErr)
 	if opt.MissingOnly {
 		// Discover fully before hashing, so -m's reads don't interleave with batch writes.
 		paths = slices.Values(slices.Collect(paths))
@@ -195,6 +196,10 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 	if discoverErr != nil {
 		return res, discoverErr
 	}
+	// dirs exist on disk even when the walk was cancelled part way
+	if err := d.RecordDirs(dirs); err != nil {
+		return res, err
+	}
 	r.Hashed(res)
 	// Checked after Hashed so a cancel landing during commit/wait isn't lost.
 	if res.Interrupted || ctx.Err() != nil {
@@ -221,23 +226,26 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 			return res, err
 		}
 	}
-	if res.OrphanDirs, err = d.DeleteOrphanedDirs(); err != nil {
-		return res, err
-	}
 	_, err = d.DeleteOrphanedFiles()
 	return res, err
 }
 
-// discover walks the roots, reporting every file. With missingOnly it drops
+// discover walks the roots, reporting every file and appending every dir to
+// dirs (resolved, as files are stored). With missingOnly it drops
 // files recorded at the same resolved dir+name with the same size and mtime,
 // counting them as skipped.
-func discover(ctx context.Context, d *db.DB, rules Rules, roots []string, missingOnly bool, r Reporter, rt *rootTracker, res *Stats, errOut *error) iter.Seq[string] {
+func discover(ctx context.Context, d *db.DB, rules Rules, roots []string, missingOnly bool, r Reporter, rt *rootTracker, res *Stats, dirs *[]string, errOut *error) iter.Seq[string] {
 	return func(yield func(string) bool) {
 		scanned, found := 0, 0
 		// Walk yields a dir's files together, so the last dir's records are all we keep.
 		lastDir, recorded := "", map[string]db.Recorded(nil)
 		for i, root := range roots {
-			for p := range rules.Walk(root) {
+			onDir := func(dir string) {
+				if real, err := db.Resolve(dir); err == nil {
+					*dirs = append(*dirs, real)
+				}
+			}
+			for p := range rules.WalkDirs(root, onDir) {
 				// Missing-only collects discovery before HashAll runs, so a cancel must stop it here.
 				if ctx.Err() != nil {
 					return

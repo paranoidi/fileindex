@@ -58,9 +58,6 @@ func mvCmd(a *app) *cobra.Command {
 				return err
 			}
 			fmt.Fprintf(a.stdout, "\nMove completed:\n  Directory rows updated: %d\n  File instances updated: %d\n", m.Dirs, m.Files)
-			if m.OrphanDirs > 0 {
-				fmt.Fprintf(a.stdout, "  Orphaned directories cleaned up: %d\n", m.OrphanDirs)
-			}
 			return nil
 		},
 	}

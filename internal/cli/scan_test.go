@@ -268,9 +268,9 @@ func TestScanPrunes(t *testing.T) {
 	wantLines(t, out,
 		"Pruning removed file: "+filepath.Join(tree, "gone.jpg"),
 		"Pruning removed directory: "+filepath.Join(tree, "sub"),
+		"Pruning removed directory: "+filepath.Join(tree, "sub2"),
 		"Files pruned: 3",
-		"Directories pruned: 1",
-		"Removed 2 orphaned directories", // sub2 and sub2/deep: nested, so only the sweep removes them
+		"Directories pruned: 3", // sub, sub2 and sub2/deep
 	)
 	if n := count(t, d, "instance"); n != 1 {
 		t.Errorf("instances %d", n)
@@ -279,10 +279,19 @@ func TestScanPrunes(t *testing.T) {
 		t.Errorf("file rows %d (orphans not deleted)", n)
 	}
 
-	// the root stays while it still holds files
+	// dirs still on disk stay recorded, even empty: the root, an empty subdir,
+	// and one whose only file was removed
+	writeFile(t, filepath.Join(tree, "full", "z.jpg"), "z")
+	os.MkdirAll(filepath.Join(tree, "empty", "deeper"), 0o755)
+	h.mustRun("scan", tree)
 	os.Remove(filepath.Join(tree, "keep.jpg"))
-	out = h.mustRun("scan", tree)
-	noLines(t, out, "Removed empty directory: "+tree+"\n")
+	os.Remove(filepath.Join(tree, "full", "z.jpg"))
+	h.mustRun("scan", tree)
+	for _, p := range []string{tree, filepath.Join(tree, "full"), filepath.Join(tree, "empty", "deeper")} {
+		if _, found, _ := db.DirByPath(d, p); !found {
+			t.Errorf("%s not recorded", p)
+		}
+	}
 }
 
 // A hash error appears once, in the errors list on stderr.

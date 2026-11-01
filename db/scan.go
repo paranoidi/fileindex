@@ -217,8 +217,6 @@ func deleteInstancesInTree(q Querier, id int64) (int64, error) {
 }
 
 // deleteDirIfEmpty deletes the dir if it has no child dirs and no instances.
-// Correlated, not "id IN (emptyDirs)": SQLite runs that subquery over every dir
-// on each call, which made pruning O(dirs²).
 func deleteDirIfEmpty(q Querier, id int64) (bool, error) {
 	r, err := q.Exec(`DELETE FROM dir WHERE id = ?
 AND NOT EXISTS (SELECT 1 FROM dir WHERE parent_id = ?)
@@ -245,7 +243,8 @@ func missing(p string) (gone bool, isDir bool, err error) {
 
 // PruneDir deletes records under the dir at path (id) that are gone from disk,
 // passing one line per removal to log. The start dir itself is kept; a path
-// missing from disk loses everything under it.
+// missing from disk loses everything under it. A dir still on disk is kept
+// even when it holds nothing.
 // onDir (may be nil) is called per dir visited with the files checked so far.
 // Returns instances and dirs removed.
 //
@@ -369,26 +368,12 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 				stack = append(stack, s)
 				continue
 			}
-			n, err := deleteInstancesInTree(tx, s.id)
+			f, n, err := deleteTree(tx, s.id)
 			if err != nil {
 				return files, dirs, err
 			}
-			files, pending = files+n, pending+n
-			if ok, err := deleteDirIfEmpty(tx, s.id); err != nil {
-				return files, dirs, err
-			} else if ok {
-				dirs, pending = dirs+1, pending+1
-				log("Pruning removed directory: " + s.path)
-			}
-		}
-
-		if cur.id != id {
-			if ok, err := deleteDirIfEmpty(tx, cur.id); err != nil {
-				return files, dirs, err
-			} else if ok {
-				dirs, pending = dirs+1, pending+1
-				log("Removed empty directory: " + cur.path)
-			}
+			files, dirs, pending = files+f, dirs+n, pending+f+n
+			log("Pruning removed directory: " + s.path)
 		}
 		if err := flush(); err != nil {
 			return files, dirs, err
@@ -457,11 +442,11 @@ func (c *stmtCache) QueryRow(query string, args ...any) *sql.Row {
 	return c.tx.QueryRow(query, args...)
 }
 
-// Pruned counts what PrunePath removed. Dirs includes the orphaned dirs cleaned up after.
+// Pruned counts what PrunePath removed.
 type Pruned struct{ Files, Dirs int64 }
 
 // PrunePath prunes the indexed dir at path (PruneDir) and then deletes orphaned
-// file and dir rows. On cancel the cleanup still runs, and ctx.Err() is returned
+// file rows. On cancel the cleanup still runs, and ctx.Err() is returned
 // with the counts so far.
 func (d *DB) PrunePath(ctx context.Context, path string, onDir func(dir string, checked int), log func(msg string)) (Pruned, error) {
 	id, found, err := DirByPath(d, path)
@@ -480,19 +465,15 @@ func (d *DB) PrunePath(ctx context.Context, path string, onDir func(dir string, 
 	if _, err := d.DeleteOrphanedFiles(); err != nil {
 		return p, err
 	}
-	n, err := d.DeleteOrphanedDirs()
-	p.Dirs += n
-	if err != nil {
-		return p, err
-	}
 	return p, ctx.Err()
 }
 
 // RemovedTree counts what RemoveTree deleted.
 type RemovedTree struct{ Instances, Files, Dirs int64 }
 
-// RemoveTree deletes every instance under the indexed dir at path, then the
-// file and dir rows left orphaned. The disk is not looked at.
+// RemoveTree deletes the indexed dir at path with everything under it, the
+// file rows left orphaned, and the ancestors left empty (path scaffolding, as
+// GetOrCreatePath made it). The disk is not looked at.
 func (d *DB) RemoveTree(path string) (RemovedTree, error) {
 	var r RemovedTree
 	id, found, err := DirByPath(d, path)
@@ -502,18 +483,41 @@ func (d *DB) RemoveTree(path string) (RemovedTree, error) {
 	if !found {
 		return r, fmt.Errorf("Path '%s' not found in database", path)
 	}
-	if r.Instances, err = d.DeleteInstancesInTree(*id); err != nil {
+	tx, err := d.Begin()
+	if err != nil {
 		return r, err
 	}
-	if r.Files, err = d.DeleteOrphanedFiles(); err != nil {
+	defer tx.Rollback()
+	var parent sql.NullInt64
+	if err := tx.QueryRow("SELECT parent_id FROM dir WHERE id = ?", *id).Scan(&parent); err != nil {
 		return r, err
 	}
-	r.Dirs, err = d.DeleteOrphanedDirs()
+	if r.Instances, r.Dirs, err = deleteTree(tx, *id); err != nil {
+		return r, err
+	}
+	for parent.Valid {
+		cur := parent.Int64
+		if err := tx.QueryRow("SELECT parent_id FROM dir WHERE id = ?", cur).Scan(&parent); err != nil {
+			return r, err
+		}
+		ok, err := deleteDirIfEmpty(tx, cur)
+		if err != nil {
+			return r, err
+		}
+		if !ok {
+			break
+		}
+		r.Dirs++
+	}
+	if err := tx.Commit(); err != nil {
+		return r, err
+	}
+	r.Files, err = d.DeleteOrphanedFiles()
 	return r, err
 }
 
-// RemoveInstance deletes the instance at the absolute file path, its file row
-// if no other instance uses it, and the dirs left empty above it. Returns an
+// RemoveInstance deletes the instance at the absolute file path and its file
+// row if no other instance uses it. Its dir stays, even when left empty. Returns an
 // error wrapping fs.ErrNotExist if the path is not indexed. The disk is not
 // looked at.
 func (d *DB) RemoveInstance(path string) (RemovedTree, error) {
@@ -548,24 +552,5 @@ func (d *DB) RemoveInstance(path string) (RemovedTree, error) {
 		return r, err
 	}
 	r.Files, _ = res.RowsAffected()
-	// Walk up while dirs are empty; dir_tag rows go by cascade, as in DeleteOrphanedDirs.
-	for cur := *dirID; ; {
-		var parent sql.NullInt64
-		if err := tx.QueryRow("SELECT parent_id FROM dir WHERE id = ?", cur).Scan(&parent); err != nil {
-			return r, err
-		}
-		ok, err := deleteDirIfEmpty(tx, cur)
-		if err != nil {
-			return r, err
-		}
-		if !ok {
-			break
-		}
-		r.Dirs++
-		if !parent.Valid {
-			break
-		}
-		cur = parent.Int64
-	}
 	return r, tx.Commit()
 }

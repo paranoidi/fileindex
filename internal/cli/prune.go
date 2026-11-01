@@ -60,7 +60,6 @@ func removeCmd(a *app) *cobra.Command {
 			w := a.stdout
 			fmt.Fprintf(w, "Removing all instances in directory tree: %s\n", path)
 			fmt.Fprintln(w, "Cleaning up orphaned file records")
-			fmt.Fprintln(w, "Cleaning up orphaned directories")
 			fmt.Fprintf(w, "\nRemoved from database:\n  Instances removed: %d\n  Files removed: %d\n  Directories removed: %d\n", r.Instances, r.Files, r.Dirs)
 			return nil
 		},

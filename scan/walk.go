@@ -69,12 +69,16 @@ func KeyOf(fi fs.FileInfo) (DirKey, bool) {
 	return DirKey{uint64(st.Dev), st.Ino}, true
 }
 
-// Walk yields every non-empty regular file under root that the rules include,
-// top-down. A root that is a file is yielded on its own if included and non-empty.
+// Walk yields every regular file under root that the rules include, top-down.
+// A root that is a file is yielded on its own if included.
 // Symlinks to files are always followed; symlinks to dirs only with FollowSymlinks,
 // and each real dir is entered once, so symlink loops end.
 // Problems are logged as warnings and the walk carries on.
-func (r Rules) Walk(root string) iter.Seq[string] {
+func (r Rules) Walk(root string) iter.Seq[string] { return r.WalkDirs(root, nil) }
+
+// WalkDirs is Walk that also passes every dir it enters to onDir (when not nil),
+// root first and each dir before its files, so empty dirs are seen too.
+func (r Rules) WalkDirs(root string, onDir func(dir string)) iter.Seq[string] {
 	return func(yield func(string) bool) {
 		fi, err := os.Stat(root)
 		if err != nil {
@@ -91,11 +95,14 @@ func (r Rules) Walk(root string) iter.Seq[string] {
 		if k, ok := KeyOf(fi); ok {
 			visited[k] = true
 		}
-		r.walkDir(root, visited, yield)
+		r.walkDir(root, visited, onDir, yield)
 	}
 }
 
-func (r Rules) walkDir(dir string, visited map[DirKey]bool, yield func(string) bool) bool {
+func (r Rules) walkDir(dir string, visited map[DirKey]bool, onDir func(string), yield func(string) bool) bool {
+	if onDir != nil {
+		onDir(dir)
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		Logger.Warn(fmt.Sprintf("Error walking directory: %v", err))
@@ -147,7 +154,7 @@ func (r Rules) walkDir(dir string, visited map[DirKey]bool, yield func(string) b
 			}
 			visited[k] = true
 		}
-		if !r.walkDir(sub, visited, yield) {
+		if !r.walkDir(sub, visited, onDir, yield) {
 			return false
 		}
 	}

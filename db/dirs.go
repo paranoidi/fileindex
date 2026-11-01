@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -166,24 +167,53 @@ func InList(ids []int64) (string, []any) {
 	return strings.TrimSuffix(strings.Repeat("?,", len(ids)), ","), args
 }
 
-const emptyDirs = `SELECT d.id FROM dir d
-LEFT JOIN dir child ON d.id = child.parent_id
-LEFT JOIN instance i ON d.id = i.dir_id
-WHERE child.id IS NULL AND i.id IS NULL`
-
-// DeleteOrphanedDirs repeatedly deletes empty leaf dirs across the whole DB
-// until none are left, and returns the total.
-func (d *DB) DeleteOrphanedDirs() (int64, error) {
-	var total int64
-	for {
-		res, err := d.Exec("DELETE FROM dir WHERE id IN (" + emptyDirs + ")")
-		if err != nil {
-			return total, err
-		}
-		n, _ := res.RowsAffected()
-		if n == 0 {
-			return total, nil
-		}
-		total += n
+// RecordDirs records each absolute, resolved dir path (touching last_seen of
+// known ones) in one transaction, so a scan keeps dirs that hold no files.
+// Paths in walk order hit the parent cache: two statements per dir.
+func (d *DB) RecordDirs(paths []string) error {
+	if len(paths) == 0 {
+		return nil
 	}
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	ids := make(map[string]int64, len(paths))
+	for _, p := range paths {
+		var id int64
+		if parent, ok := ids[filepath.Dir(p)]; ok && filepath.Dir(p) != p {
+			if id, err = GetOrCreateDir(tx, &parent, filepath.Base(p)); err != nil {
+				return err
+			}
+		} else {
+			ptr, err := GetOrCreatePath(tx, p)
+			if err != nil {
+				return err
+			}
+			if ptr == nil {
+				continue
+			}
+			id = *ptr
+		}
+		ids[p] = id
+	}
+	return tx.Commit()
+}
+
+// deleteTree deletes the dir and everything under it, returning the instances
+// and dirs removed. Instances go first and explicitly so their FTS triggers run;
+// subdirs and dir_tag rows go by ON DELETE CASCADE.
+func deleteTree(q Querier, id int64) (files, dirs int64, err error) {
+	ids, err := TreeIDs(q, &id, true)
+	if err != nil || len(ids) == 0 {
+		return 0, 0, err
+	}
+	if files, err = deleteInstancesInTree(q, id); err != nil {
+		return 0, 0, err
+	}
+	if _, err := q.Exec("DELETE FROM dir WHERE id = ?", id); err != nil {
+		return files, 0, err
+	}
+	return files, int64(len(ids)), nil
 }

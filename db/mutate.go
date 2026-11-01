@@ -132,11 +132,11 @@ WHERE s.parent_id = ? ORDER BY s.name`, dst, src)
 }
 
 // Moved counts what Move changed.
-type Moved struct{ Dirs, Files, OrphanDirs int64 }
+type Moved struct{ Dirs, Files int64 }
 
 // Move records that the file or dir at src now lives at dst (both absolute and
 // resolved): an instance is moved, a dir is moved or, when dst is already an
-// indexed dir, merged into it. Orphaned dirs are cleaned up after.
+// indexed dir, merged into it. The source's parent dir stays, even when left empty.
 // check (may be nil) runs once src is found, with whether it is a dir; an error
 // from it aborts the move. The disk is not looked at otherwise.
 func (d *DB) Move(src, dst string, check func(isDir bool) error) (Moved, error) {
@@ -188,6 +188,5 @@ func (d *DB) Move(src, dst string, check func(isDir bool) error) (Moved, error) 
 			m.Dirs = 1
 		}
 	}
-	m.OrphanDirs, err = d.DeleteOrphanedDirs()
-	return m, err
+	return m, nil
 }

@@ -103,12 +103,6 @@ func (a *app) scan(args []string, out io.Writer, quiet, missingOnly bool) error 
 	if st.PrunedDirs > 0 {
 		fmt.Fprintf(out, "Directories pruned: %d\n", st.PrunedDirs)
 	}
-	fmt.Fprintln(out, "\nCleaning up orphaned directories...")
-	if n := st.OrphanDirs; n == 1 {
-		fmt.Fprintln(out, "Removed 1 orphaned directory")
-	} else if n > 1 {
-		fmt.Fprintf(out, "Removed %d orphaned directories\n", n)
-	}
 
 	// ponytail: the errors list goes to stderr, not stdout,
 	// so -q still shows failures.
