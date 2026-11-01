@@ -571,3 +571,13 @@ func TestCommitScanBatch(t *testing.T) {
 		t.Errorf("duplicate in batch: last should win, got %q, %v", sha, err)
 	}
 }
+
+func TestFilesUnderMtime(t *testing.T) {
+	d := dbtest.New(t)
+	dbtest.AddFile(t, d, "/m/lantern/wick.jpg", "w")
+	id, _, _ := db.DirByPath(d, "/m/lantern")
+	got, err := d.FilesUnder(*id, true)
+	if err != nil || len(got) != 1 || got[0].Mtime != dbtest.Mtime {
+		t.Fatalf("FilesUnder = %+v, %v", got, err)
+	}
+}

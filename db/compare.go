@@ -15,13 +15,14 @@ type Entry struct {
 	MD5     string
 	IsJPEG  bool // has a sha256_noexif_jpeg
 	Size    int64
+	Mtime   string // as stored, "" when NULL; Recorded{Size, Mtime}.Unchanged compares it with a file
 }
 
 // FilesUnder lists the instances directly in dir id, or in its whole tree with
 // recursive, sorted by path.
 func (d *DB) FilesUnder(id int64, recursive bool) ([]Entry, error) {
 	q := `SELECT i.dir_id, i.filename, COALESCE(f.sha256_noexif_jpeg, f.sha256), f.sha256, f.md5,
-f.sha256_noexif_jpeg IS NOT NULL, f.filesize
+f.sha256_noexif_jpeg IS NOT NULL, f.filesize, COALESCE(CAST(i.mtime AS TEXT), '')
 FROM instance i JOIN file f ON i.file_id = f.id `
 	if recursive {
 		q = treeCTE + q + "WHERE i.dir_id IN (SELECT id FROM dir_tree)"
@@ -37,7 +38,7 @@ FROM instance i JOIN file f ON i.file_id = f.id `
 	for rows.Next() {
 		var e Entry
 		var dir int64
-		if err := rows.Scan(&dir, &e.Path, &e.Content, &e.SHA256, &e.MD5, &e.IsJPEG, &e.Size); err != nil {
+		if err := rows.Scan(&dir, &e.Path, &e.Content, &e.SHA256, &e.MD5, &e.IsJPEG, &e.Size, &e.Mtime); err != nil {
 			rows.Close()
 			return nil, err
 		}
