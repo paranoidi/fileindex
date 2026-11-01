@@ -237,6 +237,7 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 func discover(ctx context.Context, d *db.DB, rules Rules, roots []string, missingOnly bool, r Reporter, rt *rootTracker, res *Stats, dirs *[]string, errOut *error) iter.Seq[string] {
 	return func(yield func(string) bool) {
 		scanned, found := 0, 0
+		isOwn := ownFiles(d.Path)
 		// Walk yields a dir's files together, so the last dir's records are all we keep.
 		lastDir, recorded := "", map[string]db.Recorded(nil)
 		for i, root := range roots {
@@ -252,6 +253,11 @@ func discover(ctx context.Context, d *db.DB, rules Rules, roots []string, missin
 				}
 				scanned++
 				dir := filepath.Dir(p)
+				if isOwn(p) {
+					Logger.Debug("Skipping the index database: " + p)
+					res.Skipped++
+					continue
+				}
 				keep := true
 				if missingOnly {
 					if dir != lastDir {
@@ -285,5 +291,29 @@ func discover(ctx context.Context, d *db.DB, rules Rules, roots []string, missin
 			rt.walked(i)
 		}
 		r.Scan("", scanned, found, res.Skipped)
+	}
+}
+
+// ownFiles reports whether a walked path is the database at dbPath or one of
+// its -wal/-shm/-journal files. A scan must never open them: closing any fd on
+// a file drops every POSIX lock this process holds on it, SQLite's included, and
+// the next connection then truncates the -shm file under the others' mappings
+// (SQLITE_IOERR_IN_PAGE). Names are compared first; only a match is stat'ed.
+func ownFiles(dbPath string) func(p string) bool {
+	if dbPath == "" {
+		return func(string) bool { return false }
+	}
+	base := filepath.Base(dbPath)
+	names := map[string]bool{base: true, base + "-wal": true, base + "-shm": true, base + "-journal": true}
+	dbDir, err := os.Stat(filepath.Dir(dbPath))
+	if err != nil {
+		return func(string) bool { return false }
+	}
+	return func(p string) bool {
+		if !names[filepath.Base(p)] {
+			return false
+		}
+		fi, err := os.Stat(filepath.Dir(p))
+		return err == nil && os.SameFile(fi, dbDir)
 	}
 }

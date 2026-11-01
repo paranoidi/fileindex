@@ -315,3 +315,42 @@ func TestRunBatchIntervalReplacesFileCount(t *testing.T) {
 		t.Fatalf("instances stored at each RootDone = %v, want [3 3]", rec.seen)
 	}
 }
+
+// A scan whose tree holds the index never opens the database files: closing an
+// fd on them would drop SQLite's locks in this process.
+func TestRunSkipsOwnDatabase(t *testing.T) {
+	tree, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := db.Open(filepath.Join(tree, "state", "index.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	if err := d.Init(io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		t.Fatal(err)
+	}
+	write(t, tree, "notes/kettle.txt", "state/index.sqlite-backup")
+	st, err := scan.Run(context.Background(), d, []string{tree}, scan.Options{}, &recorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	rows, err := d.Query("SELECT filename FROM instance ORDER BY filename")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var n string
+		rows.Scan(&n)
+		names = append(names, n)
+	}
+	rows.Close()
+	if !slices.Equal(names, []string{"index.sqlite-backup", "kettle.txt"}) || st.Skipped < 1 {
+		t.Errorf("indexed %q, skipped %d", names, st.Skipped)
+	}
+}
