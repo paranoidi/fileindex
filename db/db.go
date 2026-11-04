@@ -1,4 +1,4 @@
-// Package db holds the schema v9 SQLite index and every query on it.
+// Package db holds the schema v10 SQLite index and every query on it.
 //
 // Read TIMESTAMP columns (mtime, created_at, last_seen) as CAST(col AS TEXT):
 // the driver otherwise parses them into time.Time and reformats them.
@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const SchemaVersion = 9
+const SchemaVersion = 10
 
 // Querier is satisfied by *sql.DB and *sql.Tx, so helpers can run inside a caller's transaction.
 type Querier interface {
@@ -103,20 +103,13 @@ CREATE TABLE dir_tag (
     FOREIGN KEY (dir_id) REFERENCES dir(id) ON DELETE CASCADE,
     UNIQUE(tag_id, dir_id)
 );
-CREATE INDEX idx_dir_parent_id ON dir(parent_id);
-CREATE INDEX idx_dir_name ON dir(name);
-CREATE INDEX idx_dir_name_lower ON dir(name_lower);
-CREATE INDEX idx_file_md5 ON file(md5);
 CREATE INDEX idx_file_sha256 ON file(sha256);
 CREATE INDEX idx_file_sha256_noexif_jpeg ON file(sha256_noexif_jpeg);
 CREATE INDEX idx_file_sha256_8kb ON file(sha256_8kb);
 CREATE INDEX idx_file_size ON file(filesize);
-CREATE INDEX idx_tag_name ON tag(name);
-CREATE INDEX idx_file_tag_tag_id ON file_tag(tag_id);
 CREATE INDEX idx_file_tag_instance_id ON file_tag(instance_id);
-CREATE INDEX idx_dir_tag_tag_id ON dir_tag(tag_id);
 CREATE INDEX idx_dir_tag_dir_id ON dir_tag(dir_id);
-` + instanceIndexes + ftsSchema + `INSERT INTO schema_version (version) VALUES (9);
+` + instanceIndexes + ftsSchema + `INSERT INTO schema_version (version) VALUES (10);
 `
 
 // instanceDDL is the instance table under the given name. file_id is NULL while
@@ -142,11 +135,7 @@ func instanceDDL(name string) string {
 `
 }
 
-const instanceIndexes = `CREATE INDEX idx_instance_dir_id ON instance(dir_id);
-CREATE INDEX idx_instance_filename ON instance(filename);
-CREATE INDEX idx_instance_filename_lower ON instance(filename_lower);
-CREATE INDEX idx_instance_file_id ON instance(file_id);
-CREATE INDEX idx_instance_mtime ON instance(mtime);
+const instanceIndexes = `CREATE INDEX idx_instance_file_id ON instance(file_id);
 ` + fastIndex
 
 // fastIndex serves PotentialDuplicates. It is partial, so instances without a
@@ -193,6 +182,25 @@ const migrateV8 = `ALTER TABLE instance ADD COLUMN sha256_8kb TEXT;
 ` + fastIndex + `INSERT INTO schema_version (version) VALUES (9);
 `
 
+// migrateV9 drops indexes no query needs. They were a fifth of the DB and every
+// instance insert paid for them: the UNIQUE constraints already index md5,
+// tag name, (dir_id, filename), (parent_id, name) and (tag_id, ...), LIKE with
+// ESCAPE cannot seek on the *_lower columns, and nothing filters on mtime or on
+// a bare filename or dir name.
+const migrateV9 = `DROP INDEX IF EXISTS idx_instance_dir_id;
+DROP INDEX IF EXISTS idx_instance_filename;
+DROP INDEX IF EXISTS idx_instance_filename_lower;
+DROP INDEX IF EXISTS idx_instance_mtime;
+DROP INDEX IF EXISTS idx_file_md5;
+DROP INDEX IF EXISTS idx_dir_parent_id;
+DROP INDEX IF EXISTS idx_dir_name;
+DROP INDEX IF EXISTS idx_dir_name_lower;
+DROP INDEX IF EXISTS idx_tag_name;
+DROP INDEX IF EXISTS idx_file_tag_tag_id;
+DROP INDEX IF EXISTS idx_dir_tag_tag_id;
+INSERT INTO schema_version (version) VALUES (10);
+`
+
 // migrateV7 rebuilds instance for the current schema, going straight to v9 since
 // instanceDDL already has v9's column (SQLite cannot drop NOT NULL in
 // place): file_id becomes nullable and size is copied from the file row. Ids are
@@ -234,7 +242,7 @@ ALTER TABLE instance_new RENAME TO instance;
 	return tx.Commit()
 }
 
-// Init switches to WAL and creates schema v9 on a new DB. An existing DB must
+// Init switches to WAL and creates the current schema on a new DB. An existing DB must
 // already be on it: only Upgrade migrates. Init and Upgrade are the only places
 // that change the journal mode or the schema.
 func (d *DB) Init() error {
@@ -251,9 +259,9 @@ func (d *DB) Init() error {
 	return d.RequireSchema()
 }
 
-// Upgrade migrates a v6, v7 or v8 DB to schema v9, announced on w since rebuilding
-// the FTS indexes takes minutes on millions of instances. A DB already on v9 is
-// left alone.
+// Upgrade migrates a v6, v7, v8 or v9 DB to the current schema, announced on w
+// since rebuilding the FTS indexes takes minutes on millions of instances. A DB
+// already current is left alone.
 func (d *DB) Upgrade(w io.Writer) error {
 	if err := d.RequireSchema(); err != ErrOutdatedSchema {
 		return err
@@ -275,12 +283,24 @@ func (d *DB) Upgrade(w io.Writer) error {
 	switch v.Int64 {
 	case 7:
 		fmt.Fprintln(w, "Migrating database to schema v9 (files indexed before hashing, fast hashes)...")
-		return d.migrateV7()
+		if err := d.migrateV7(); err != nil {
+			return err
+		}
 	case 8:
 		fmt.Fprintln(w, "Migrating database to schema v9 (fast hashes)...")
-		return d.execTx(migrateV8)
+		if err := d.execTx(migrateV8); err != nil {
+			return err
+		}
+	case 9:
+	default:
+		return fmt.Errorf("Database schema v%d is too old to upgrade, expected at least v6", v.Int64)
 	}
-	return fmt.Errorf("Database schema v%d is too old to upgrade, expected at least v6", v.Int64)
+	fmt.Fprintln(w, "Migrating database to schema v10 (redundant indexes dropped)...")
+	if err := d.execTx(migrateV9); err != nil {
+		return err
+	}
+	fmt.Fprintln(w, "`fileindex vacuum` returns the freed space to the disk; until then new data reuses it.")
+	return nil
 }
 
 func (d *DB) execTx(ddl string) error {

@@ -105,8 +105,8 @@ func TestInitSchema(t *testing.T) {
 	d := dbtest.New(t)
 	var n int
 	d.QueryRow("SELECT COUNT(*) FROM sqlite_master").Scan(&n)
-	if n != 44 { // 7 tables + 19 indexes + 6 autoindexes + 2 FTS tables, their 7 shadow tables, 3 triggers
-		t.Errorf("sqlite_master rows = %d, want 44", n)
+	if n != 33 { // 7 tables + 8 indexes + 6 autoindexes + 2 FTS tables, their 7 shadow tables, 3 triggers
+		t.Errorf("sqlite_master rows = %d, want 33", n)
 	}
 	var mode string
 	d.QueryRow("PRAGMA journal_mode").Scan(&mode)
@@ -1136,5 +1136,64 @@ func TestListingsPreloadedPaths(t *testing.T) {
 	defer db.SetPreloadDirs(1)()
 	if got := list(); !slices.Equal(got, lazy) {
 		t.Errorf("preloaded = %v, lazy = %v", got, lazy)
+	}
+}
+
+func indexNames(t *testing.T, d *db.DB) []string {
+	t.Helper()
+	rows, err := d.Query("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%' ORDER BY name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// An upgraded v9 DB ends up with the same indexes as a new one, and keeps its data.
+func TestUpgradeV9DropsRedundantIndexes(t *testing.T) {
+	d := dbtest.New(t)
+	fresh := indexNames(t, d)
+	dbtest.AddFile(t, d, "/m/a.txt", "a")
+	for _, q := range []string{
+		"CREATE INDEX idx_instance_dir_id ON instance(dir_id)",
+		"CREATE INDEX idx_instance_filename ON instance(filename)",
+		"CREATE INDEX idx_instance_filename_lower ON instance(filename_lower)",
+		"CREATE INDEX idx_instance_mtime ON instance(mtime)",
+		"CREATE INDEX idx_file_md5 ON file(md5)",
+		"CREATE INDEX idx_dir_parent_id ON dir(parent_id)",
+		"CREATE INDEX idx_dir_name ON dir(name)",
+		"CREATE INDEX idx_dir_name_lower ON dir(name_lower)",
+		"CREATE INDEX idx_tag_name ON tag(name)",
+		"CREATE INDEX idx_file_tag_tag_id ON file_tag(tag_id)",
+		"CREATE INDEX idx_dir_tag_tag_id ON dir_tag(tag_id)",
+		"DELETE FROM schema_version", "INSERT INTO schema_version (version) VALUES (9)",
+	} {
+		if _, err := d.Exec(q); err != nil {
+			t.Fatal(q, err)
+		}
+	}
+	if err := d.RequireSchema(); err != db.ErrOutdatedSchema {
+		t.Fatalf("RequireSchema = %v", err)
+	}
+	var out strings.Builder
+	if err := d.Upgrade(&out); err != nil || !strings.Contains(out.String(), "schema v10") {
+		t.Fatalf("Upgrade: %v, %q", err, out.String())
+	}
+	if err := d.RequireSchema(); err != nil {
+		t.Fatal(err)
+	}
+	if got := indexNames(t, d); !slices.Equal(got, fresh) {
+		t.Errorf("indexes = %v, want %v", got, fresh)
+	}
+	if files, err := d.DirFiles("/m"); err != nil || len(files) != 1 {
+		t.Errorf("DirFiles = %v, %v", files, err)
 	}
 }

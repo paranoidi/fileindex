@@ -87,7 +87,7 @@ func TestUsageErrorsExit2(t *testing.T) {
 func TestInitSchemaVersionMismatch(t *testing.T) {
 	h := newHarness(t)
 	d := dbtest.Init(t, h.dbPath())
-	if _, err := d.Exec("INSERT INTO schema_version (version) VALUES (10)"); err != nil {
+	if _, err := d.Exec("INSERT INTO schema_version (version) VALUES (11)"); err != nil {
 		t.Fatal(err)
 	}
 	code, _, errOut := h.run("init")
@@ -109,7 +109,7 @@ func TestInitRefusesOutdatedThenUpgradeDB(t *testing.T) {
 		t.Fatalf("init: exit %d, stderr %q", code, errOut)
 	}
 	code, out, errOut := h.run("upgrade-db")
-	if code != 0 || out != "Database at schema v9: "+h.dbPath()+"\n" || !strings.Contains(errOut, "Migrating") {
+	if code != 0 || out != "Database at schema v10: "+h.dbPath()+"\n" || !strings.Contains(errOut, "Migrating") {
 		t.Fatalf("upgrade-db: exit %d, stdout %q, stderr %q", code, out, errOut)
 	}
 	code, _, errOut = h.run("upgrade-db") // already current
