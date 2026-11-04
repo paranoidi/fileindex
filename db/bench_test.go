@@ -13,6 +13,7 @@ import (
 
 	"github.com/paranoidi/fileindex/db"
 	"github.com/paranoidi/fileindex/internal/dbtest"
+	"github.com/paranoidi/fileindex/scan"
 )
 
 var benchWords = []string{"holiday", "report", "final", "draft", "photo", "invoice", "summer", "backup", "music", "track",
@@ -74,6 +75,104 @@ func BenchmarkPruneDir(b *testing.B) {
 		n, _, err := d.PruneDir(context.Background(), root, *id, nil, func(string) {})
 		if err != nil || n != total {
 			b.Fatal(n, err)
+		}
+	}
+}
+
+// seedDirs inserts a tree of n dirs under "/" (ten children each), fast.
+func seedDirs(b *testing.B, d *db.DB, n int) {
+	b.Helper()
+	if _, err := d.Exec(`INSERT INTO dir (id, parent_id, name, name_lower) VALUES (1, NULL, '/', '/');
+WITH RECURSIVE s(i) AS (SELECT 2 UNION ALL SELECT i + 1 FROM s WHERE i < ?)
+INSERT INTO dir (id, parent_id, name, name_lower) SELECT i, 1 + (i - 2) / 10, 'd' || i, 'd' || i FROM s`, n); err != nil {
+		b.Fatal(err)
+	}
+}
+
+// BenchmarkUnhashedPaging pages through 5k unhashed files in a tree of 100k
+// dirs, as hashing does. Its cost should follow the files, not dirs x pages.
+func BenchmarkUnhashedPaging(b *testing.B) {
+	const dirs, files = 100000, 5000
+	d := dbtest.New(b)
+	seedDirs(b, d, dirs)
+	if _, err := d.Exec(`WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < ?)
+INSERT INTO instance (dir_id, filename, filename_lower, size) SELECT 2 + i * 19, 'f' || i, 'f' || i, 1 FROM s`, files); err != nil {
+		b.Fatal(err)
+	}
+	for b.Loop() {
+		pages, err := d.UnhashedPages("/", false)
+		if err != nil {
+			b.Fatal(err)
+		}
+		n := 0
+		for {
+			page, err := pages.Next(1000)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if len(page) == 0 {
+				break
+			}
+			n += len(page)
+		}
+		if n != files {
+			b.Fatal(n)
+		}
+	}
+}
+
+// BenchmarkDeleteOrphans sweeps 500k file rows with none to delete: what every
+// scan that changes something pays.
+func BenchmarkDeleteOrphans(b *testing.B) {
+	const files = 500000
+	d := dbtest.New(b)
+	seedDirs(b, d, 2)
+	if _, err := d.Exec(`WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < ?)
+INSERT INTO file (id, md5, sha256, filesize) SELECT i, 'm' || i, 's' || i, 1 FROM s`, files); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := d.Exec(`INSERT INTO instance (file_id, dir_id, filename, filename_lower, size)
+SELECT id, 2, 'f' || id, 'f' || id, 1 FROM file`); err != nil {
+		b.Fatal(err)
+	}
+	for b.Loop() {
+		if n, err := d.DeleteOrphanedFiles(); err != nil || n != 0 {
+			b.Fatal(n, err)
+		}
+	}
+}
+
+type nopReporter struct{}
+
+func (nopReporter) Worker(int, string)         {}
+func (nopReporter) Speed(int, float64)         {}
+func (nopReporter) Scan(string, int, int, int) {}
+func (nopReporter) Hashed(scan.Stats)          {}
+func (nopReporter) Prune(string, int)          {}
+func (nopReporter) Log(string)                 {}
+
+// BenchmarkRescan rescans an unchanged tree of 2k files in 200 dirs: walk, skip
+// check and prune, with nothing to write or hash.
+func BenchmarkRescan(b *testing.B) {
+	d := dbtest.New(b)
+	root := b.TempDir()
+	for i := range 2000 {
+		dir := filepath.Join(root, fmt.Sprintf("a%d", i/200), fmt.Sprintf("b%d", i/10))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			b.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%d", i)), fmt.Append(nil, i), 0o644); err != nil {
+			b.Fatal(err)
+		}
+	}
+	opt := scan.Options{MissingOnly: true}
+	if _, err := scan.Run(context.Background(), d, []string{root}, opt, nopReporter{}); err != nil {
+		b.Fatal(err)
+	}
+	for b.Loop() {
+		st, err := scan.Run(context.Background(), d, []string{root}, opt, nopReporter{})
+		if err != nil || st.Skipped != 2000 {
+			b.Fatal(st, err)
 		}
 	}
 }
