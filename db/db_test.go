@@ -975,3 +975,41 @@ FROM file f JOIN instance i ON i.file_id = f.id WHERE f.filesize > 0`)
 		t.Errorf("Duplicates = %v\nwant %v", got, want)
 	}
 }
+
+func TestDirListerReusesAndRefreshes(t *testing.T) {
+	d := dbtest.New(t)
+	dbtest.AddFile(t, d, "/a/b/c/one", "1")
+	dbtest.AddFile(t, d, "/a/b/d/two", "2")
+	dbtest.AddFile(t, d, "/x/three", "3")
+	l, err := d.NewDirLister()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	has := func(dir, name string) bool {
+		t.Helper()
+		files, err := l.Files(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, ok := files[name]
+		return ok
+	}
+	for _, c := range []struct {
+		dir, name string
+		want      bool
+	}{
+		{"/a/b/c", "one", true}, {"/a/b/d", "two", true}, {"/a/b/d", "one", false},
+		{"/x", "three", true}, {"/a/b/c", "one", true},
+		{"/a/new/deep", "four", false}, {"/a/b", "one", false}, {"", "one", false},
+	} {
+		if got := has(c.dir, c.name); got != c.want {
+			t.Errorf("Files(%q)[%q] = %v, want %v", c.dir, c.name, got, c.want)
+		}
+	}
+	// A dir that was missing is found once it exists: misses aren't remembered.
+	dbtest.AddFile(t, d, "/a/new/deep/four", "4")
+	if !has("/a/new/deep", "four") {
+		t.Error("dir created after a miss not found")
+	}
+}

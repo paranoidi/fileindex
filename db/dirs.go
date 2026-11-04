@@ -10,16 +10,14 @@ import (
 // Dir ids are *int64: nil is the virtual root above the top-level dirs (the
 // "/" row for absolute paths), so lookups use SQL's `parent_id IS ?`.
 
-// GetOrCreateDir finds name under parent (touching last_seen) or inserts it.
+// GetOrCreateDir finds name under parent or inserts it. A found dir is not
+// written: touching last_seen, which nothing reads, made every rescan rewrite
+// the whole dir table.
 func GetOrCreateDir(q Querier, parent *int64, name string) (int64, error) {
 	var id int64
 	err := q.QueryRow("SELECT id FROM dir WHERE parent_id IS ? AND name = ?", parent, name).Scan(&id)
-	if err == nil {
-		_, err = q.Exec("UPDATE dir SET last_seen = CURRENT_TIMESTAMP WHERE id = ?", id)
-		return id, err
-	}
 	if err != sql.ErrNoRows {
-		return 0, err
+		return id, err
 	}
 	res, err := q.Exec("INSERT INTO dir (parent_id, name, name_lower) VALUES (?, ?, ?)", parent, name, Lower(name))
 	if err != nil {
@@ -228,9 +226,9 @@ func InList(ids []int64) (string, []any) {
 	return strings.TrimSuffix(strings.Repeat("?,", len(ids)), ","), args
 }
 
-// RecordDirs records each absolute, resolved dir path (touching last_seen of
-// known ones) in one transaction, so a scan keeps dirs that hold no files.
-// Paths in walk order hit the parent cache: two statements per dir.
+// RecordDirs records each absolute, resolved dir path in one transaction, so a
+// scan keeps dirs that hold no files. Paths in walk order hit the parent cache:
+// one lookup per dir.
 func (d *DB) RecordDirs(paths []string) error {
 	if len(paths) == 0 {
 		return nil

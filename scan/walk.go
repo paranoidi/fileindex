@@ -74,12 +74,21 @@ func KeyOf(fi fs.FileInfo) (DirKey, bool) {
 // Symlinks to files are always followed; symlinks to dirs only with FollowSymlinks,
 // and each real dir is entered once, so symlink loops end.
 // Problems are logged as warnings and the walk carries on.
-func (r Rules) Walk(root string) iter.Seq[string] { return r.WalkDirs(root, nil) }
+func (r Rules) Walk(root string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		for p := range r.WalkDirs(root, nil) {
+			if !yield(p) {
+				return
+			}
+		}
+	}
+}
 
 // WalkDirs is Walk that also passes every dir it enters to onDir (when not nil),
-// root first and each dir before its files, so empty dirs are seen too.
-func (r Rules) WalkDirs(root string, onDir func(dir string)) iter.Seq[string] {
-	return func(yield func(string) bool) {
+// root first and each dir before its files, so empty dirs are seen too, and
+// yields each file's stat (symlinks followed) so callers need not repeat it.
+func (r Rules) WalkDirs(root string, onDir func(dir string)) iter.Seq2[string, fs.FileInfo] {
+	return func(yield func(string, fs.FileInfo) bool) {
 		fi, err := os.Stat(root)
 		if err != nil {
 			Logger.Warn("Path does not exist: " + root)
@@ -87,7 +96,7 @@ func (r Rules) WalkDirs(root string, onDir func(dir string)) iter.Seq[string] {
 		}
 		if !fi.IsDir() {
 			if r.IncludeFile(filepath.Base(root)) && fi.Mode().IsRegular() {
-				yield(root)
+				yield(root, fi)
 			}
 			return
 		}
@@ -99,7 +108,7 @@ func (r Rules) WalkDirs(root string, onDir func(dir string)) iter.Seq[string] {
 	}
 }
 
-func (r Rules) walkDir(dir string, visited map[DirKey]bool, onDir func(string), yield func(string) bool) bool {
+func (r Rules) walkDir(dir string, visited map[DirKey]bool, onDir func(string), yield func(string, fs.FileInfo) bool) bool {
 	if onDir != nil {
 		onDir(dir)
 	}
@@ -137,7 +146,7 @@ func (r Rules) walkDir(dir string, visited map[DirKey]bool, onDir func(string), 
 		case !fi.Mode().IsRegular():
 			Logger.Debug("Skipping non-regular file: " + p)
 		default:
-			if !yield(p) {
+			if !yield(p, fi) {
 				return false
 			}
 		}

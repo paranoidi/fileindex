@@ -82,15 +82,85 @@ func (r Recorded) Unchanged(size int64, mtime time.Time) bool {
 }
 
 // DirFiles returns the instances recorded directly in dir, by filename; a dir
-// not in the index gives an empty map. Scan's skip check loads each dir once.
+// not in the index gives an empty map. For many dirs, use a DirLister.
 func (d *DB) DirFiles(dir string) (map[string]Recorded, error) {
+	l, err := d.NewDirLister()
+	if err != nil {
+		return nil, err
+	}
+	defer l.Close()
+	return l.Files(dir)
+}
+
+// DirLister loads the instances of dir after dir for scan's skip check, which
+// runs once per dir walked. Parsing a query per path component per dir was over
+// a third of a no-op rescan, so it prepares its queries and keeps the ids of the
+// last path: a walk's next dir shares most of its components. Not safe for
+// concurrent use.
+type DirLister struct {
+	child, files *sql.Stmt
+	parts        []string
+	ids          []int64 // ids[i] is the dir at parts[:i+1]
+}
+
+func (d *DB) NewDirLister() (*DirLister, error) {
+	child, err := d.Prepare("SELECT id FROM dir WHERE parent_id IS ? AND name = ?")
+	if err != nil {
+		return nil, err
+	}
+	files, err := d.Prepare(`SELECT filename, size, COALESCE(CAST(mtime AS TEXT), ''), file_id IS NOT NULL, sha256_8kb IS NOT NULL
+FROM instance WHERE dir_id = ?`)
+	if err != nil {
+		_ = child.Close()
+		return nil, err
+	}
+	return &DirLister{child: child, files: files}, nil
+}
+
+func (l *DirLister) Close() {
+	_ = l.child.Close()
+	_ = l.files.Close()
+}
+
+// dirID is DirByPath, reusing the ids of the components shared with the last path.
+// Only found dirs are kept, so a dir created since a miss is found next time.
+func (l *DirLister) dirID(path string) (int64, bool, error) {
+	parts := PathParts(path)
+	if len(parts) == 0 {
+		return 0, false, nil
+	}
+	n := 0
+	for n < len(l.ids) && n < len(parts) && l.parts[n] == parts[n] {
+		n++
+	}
+	l.parts, l.ids = parts, l.ids[:n]
+	for _, part := range parts[n:] {
+		var parent *int64
+		if len(l.ids) > 0 {
+			parent = &l.ids[len(l.ids)-1]
+		}
+		var id int64
+		err := l.child.QueryRow(parent, part).Scan(&id)
+		if err == sql.ErrNoRows {
+			return 0, false, nil
+		}
+		if err != nil {
+			return 0, false, err
+		}
+		l.ids = append(l.ids, id)
+	}
+	return l.ids[len(l.ids)-1], true, nil
+}
+
+// Files returns the instances recorded directly in dir, by filename; a dir
+// not in the index gives an empty map.
+func (l *DirLister) Files(dir string) (map[string]Recorded, error) {
 	out := map[string]Recorded{}
-	dirID, found, err := DirByPath(d, dir)
+	dirID, found, err := l.dirID(dir)
 	if err != nil || !found {
 		return out, err
 	}
-	rows, err := d.Query(`SELECT filename, size, COALESCE(CAST(mtime AS TEXT), ''), file_id IS NOT NULL, sha256_8kb IS NOT NULL
-FROM instance WHERE dir_id = ?`, *dirID)
+	rows, err := l.files.Query(dirID)
 	if err != nil {
 		return nil, err
 	}
@@ -125,10 +195,10 @@ func (d *DB) CommitDiscovered(files []DiscoveredFile, dirs []string) (BatchResul
 		return res, err
 	}
 	defer tx.Rollback()
-	if err := recordDirs(tx, dirs); err != nil {
+	q := &stmtCache{tx: tx, stmts: map[string]*sql.Stmt{}}
+	if err := recordDirs(q, dirs); err != nil {
 		return res, err
 	}
-	q := &stmtCache{tx: tx, stmts: map[string]*sql.Stmt{}}
 	dirIDs := map[string]*int64{}
 	var newRows [][]any
 	added := map[newKey]int{}
@@ -442,7 +512,8 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 		return 0, 0, err
 	}
 	defer func() { tx.Rollback() }() // the tx current at return; a no-op once committed
-	pending := int64(0)              // deletions since the last commit
+	q := &stmtCache{tx: tx, stmts: map[string]*sql.Stmt{}}
+	pending := int64(0) // deletions since the last commit
 	flush := func() error {
 		if pending < pruneBatch {
 			return nil
@@ -455,6 +526,7 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 			return err
 		}
 		tx, pending = next, 0
+		q = &stmtCache{tx: tx, stmts: map[string]*sql.Stmt{}}
 		return nil
 	}
 
@@ -474,7 +546,7 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 
-		names, err := queryStrings(tx, "SELECT filename FROM instance WHERE dir_id = ? ORDER BY filename", cur.id)
+		names, err := queryStrings(q, "SELECT filename FROM instance WHERE dir_id = ? ORDER BY filename", cur.id)
 		if err != nil {
 			return files, dirs, err
 		}
@@ -522,7 +594,7 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 			}
 		}
 
-		rows, err := tx.Query("SELECT id, name FROM dir WHERE parent_id = ? ORDER BY name", cur.id)
+		rows, err := q.Query("SELECT id, name FROM dir WHERE parent_id = ? ORDER BY name", cur.id)
 		if err != nil {
 			return files, dirs, err
 		}

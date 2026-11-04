@@ -257,8 +257,12 @@ func discover(ctx context.Context, d *db.DB, opt Options, maxFiles int, roots []
 			werr = flush()
 		}
 	}
+	// Resolve costs an lstat per path component, so it runs once per dir, here:
+	// the walk enters a dir before yielding its files.
+	walkedDir, realDir, realErr := "", "", error(nil)
 	onDir := func(dir string) {
 		real, err := db.Resolve(dir)
+		walkedDir, realDir, realErr = dir, real, err
 		if werr != nil || err != nil {
 			return
 		}
@@ -271,9 +275,14 @@ func discover(ctx context.Context, d *db.DB, opt Options, maxFiles int, roots []
 
 	// Walk yields a dir's files together, so the last dir's records are all we keep.
 	lastDir, recorded := "", map[string]db.Recorded(nil)
+	lister, err := d.NewDirLister()
+	if err != nil {
+		return nil, err
+	}
+	defer lister.Close()
 walk:
 	for i, root := range roots {
-		for p := range opt.Rules.WalkDirs(root, onDir) {
+		for p, fi := range opt.Rules.WalkDirs(root, onDir) {
 			if ctx.Err() != nil || werr != nil {
 				break walk
 			}
@@ -284,24 +293,20 @@ walk:
 				res.Skipped++
 				continue
 			}
-			fi, err := os.Stat(p)
-			if err == nil && !fi.Mode().IsRegular() {
-				err = fmt.Errorf("Path is not a regular file: %s", p)
+			if dir != walkedDir { // a root that is a file: no dir was entered
+				walkedDir = dir
+				realDir, realErr = db.Resolve(dir)
 			}
-			realDir := ""
-			if err == nil {
-				realDir, err = db.Resolve(dir) // stored under the real path
-			}
-			if err != nil {
+			if realErr != nil {
 				res.Errored++
-				res.Errors = append(res.Errors, fmt.Sprintf("Error processing file info for %s: %v", p, err))
+				res.Errors = append(res.Errors, fmt.Sprintf("Error processing file info for %s: %v", p, realErr))
 				continue
 			}
 			write := true
 			if opt.MissingOnly {
 				if realDir != lastDir {
 					lastDir = realDir
-					if recorded, werr = d.DirFiles(realDir); werr != nil {
+					if recorded, werr = lister.Files(realDir); werr != nil {
 						break walk
 					}
 				}
