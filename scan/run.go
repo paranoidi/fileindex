@@ -172,9 +172,11 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 			if err := hashPending(ctx, d, opt, maxFiles, scopes, r, &res); err != nil {
 				return res, err
 			}
-			// hashing re-attaches or replaces file rows: drop what lost its last instance
-			if _, err := d.DeleteOrphanedFiles(); err != nil {
-				return res, err
+			// a changed file re-hashed to new content leaves its old row behind
+			if res.mayOrphan() {
+				if _, err := d.DeleteOrphanedFiles(); err != nil {
+					return res, err
+				}
 			}
 		}
 	}
@@ -204,8 +206,20 @@ func pruneRoots(ctx context.Context, d *db.DB, roots []string, r Reporter, res *
 			return err
 		}
 	}
+	if !res.mayOrphan() {
+		return nil
+	}
 	_, err := d.DeleteOrphanedFiles()
 	return err
+}
+
+// mayOrphan reports whether this run can have left file rows with no instance:
+// only clearing an instance's file_id or deleting an instance does. The sweep
+// scans the whole file table (seconds at 10M), too much for a scan changing nothing.
+// ponytail: orphans of a scan cancelled during discovery wait for the next scan
+// that changes something, or for prune.
+func (s Stats) mayOrphan() bool {
+	return s.Updated > 0 || s.PrunedFiles > 0 || s.PrunedDirs > 0
 }
 
 // discover is phase 1. It walks the roots and commits each batch (synchronously,
