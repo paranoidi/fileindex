@@ -60,11 +60,13 @@ type ScannedFile struct {
 func (f ScannedFile) Path() string { return filepath.Join(f.Dir, f.Name) }
 
 // Recorded is the size and stored mtime ("" when NULL) of an indexed instance;
-// Hashed is false while the instance waits to be hashed.
+// Hashed is false while the instance waits to be hashed, and Fast is true once
+// its first 8 KB are hashed.
 type Recorded struct {
 	Size   int64
 	Mtime  string
 	Hashed bool
+	Fast   bool
 }
 
 // Same reports whether the file still has the recorded size and mtime,
@@ -87,7 +89,7 @@ func (d *DB) DirFiles(dir string) (map[string]Recorded, error) {
 	if err != nil || !found {
 		return out, err
 	}
-	rows, err := d.Query(`SELECT filename, size, COALESCE(CAST(mtime AS TEXT), ''), file_id IS NOT NULL
+	rows, err := d.Query(`SELECT filename, size, COALESCE(CAST(mtime AS TEXT), ''), file_id IS NOT NULL, sha256_8kb IS NOT NULL
 FROM instance WHERE dir_id = ?`, *dirID)
 	if err != nil {
 		return nil, err
@@ -96,7 +98,7 @@ FROM instance WHERE dir_id = ?`, *dirID)
 	for rows.Next() {
 		var name string
 		var r Recorded
-		if err := rows.Scan(&name, &r.Size, &r.Mtime, &r.Hashed); err != nil {
+		if err := rows.Scan(&name, &r.Size, &r.Mtime, &r.Hashed, &r.Fast); err != nil {
 			return nil, err
 		}
 		out[name] = r
@@ -114,7 +116,7 @@ type DiscoveredFile struct {
 // CommitDiscovered records a batch of walked files as unhashed instances, and
 // the dirs the walk entered (absolute, resolved, in walk order), in one
 // transaction, so the files are findable by name at once. An existing instance
-// gets the new size and mtime and loses its file_id: a stale hash never
+// gets the new size and mtime and loses its file_id and fast hash: a stale hash never
 // survives a change. One INSERT writes all new instances (see CommitScanBatch).
 func (d *DB) CommitDiscovered(files []DiscoveredFile, dirs []string) (BatchResult, error) {
 	res := BatchResult{Failed: map[int]error{}}
@@ -144,7 +146,7 @@ func (d *DB) CommitDiscovered(files []DiscoveredFile, dirs []string) (BatchResul
 		switch err {
 		case nil:
 			res.Updated++
-			_, err = q.Exec("UPDATE instance SET file_id = NULL, size = ?, mtime = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?", f.Size, mtime, instID)
+			_, err = q.Exec("UPDATE instance SET file_id = NULL, sha256_8kb = NULL, size = ?, mtime = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?", f.Size, mtime, instID)
 		case sql.ErrNoRows:
 			k := newKey{dirID, f.Name}
 			if j, dup := added[k]; dup {
@@ -188,9 +190,10 @@ type UnhashedInstance struct {
 
 // UnhashedUnder returns up to limit unhashed instances with id > after, by id,
 // in the dir tree at path or, when path is an indexed file, that file. Page by
-// passing the last id back; the memory held is one page.
-func (d *DB) UnhashedUnder(path string, after int64, limit int) ([]UnhashedInstance, error) {
-	q, args, err := d.unhashedScope(path)
+// passing the last id back; the memory held is one page. With skipFast,
+// instances that are already fast-hashed are left out.
+func (d *DB) UnhashedUnder(path string, after int64, limit int, skipFast bool) ([]UnhashedInstance, error) {
+	q, args, err := d.unhashedScope(path, skipFast)
 	if err != nil || q == "" {
 		return nil, err
 	}
@@ -226,8 +229,8 @@ func (d *DB) UnhashedUnder(path string, after int64, limit int) ([]UnhashedInsta
 }
 
 // CountUnhashed counts the instances UnhashedUnder would page through.
-func (d *DB) CountUnhashed(path string) (int, error) {
-	q, args, err := d.unhashedScope(path)
+func (d *DB) CountUnhashed(path string, skipFast bool) (int, error) {
+	q, args, err := d.unhashedScope(path, skipFast)
 	if err != nil || q == "" {
 		return 0, err
 	}
@@ -238,8 +241,11 @@ func (d *DB) CountUnhashed(path string) (int, error) {
 
 // unhashedScope is the query (id, dir_id, filename) of unhashed instances at
 // path; "" when path is not in the index.
-func (d *DB) unhashedScope(path string) (string, []any, error) {
-	const cols = "SELECT i.id, i.dir_id, i.filename FROM instance i WHERE i.file_id IS NULL"
+func (d *DB) unhashedScope(path string, skipFast bool) (string, []any, error) {
+	cols := "SELECT i.id, i.dir_id, i.filename FROM instance i WHERE i.file_id IS NULL"
+	if skipFast {
+		cols += " AND i.sha256_8kb IS NULL"
+	}
 	id, found, err := DirByPath(d, path)
 	if err != nil {
 		return "", nil, err
@@ -269,6 +275,8 @@ type BatchResult struct {
 // hashes were taken at, so a file that changed since the walk is stored as it
 // was hashed. Files are
 // matched by sha256; NULL hash columns of a matched row are backfilled.
+// An entry with no SHA256 is fast-hashed: it only updates its instance, which
+// stays unhashed.
 // A file whose md5 is already recorded with a different sha256 is reported as a
 // per-file failure instead of aborting the batch.
 func (d *DB) CommitScanBatch(files []ScannedFile) (BatchResult, error) {
@@ -282,7 +290,30 @@ func (d *DB) CommitScanBatch(files []ScannedFile) (BatchResult, error) {
 	dirs := map[string]*int64{} // a batch is mostly a few dirs; resolve each once
 	var newRows [][]any         // instances to insert, in one statement at the end
 	added := map[newKey]int{}   // index into newRows
+	dirOf := func(dir string) (*int64, error) {
+		id, ok := dirs[dir]
+		if !ok {
+			var err error
+			if id, err = GetOrCreatePath(q, dir); err != nil {
+				return nil, err
+			}
+			dirs[dir] = id
+		}
+		return id, nil
+	}
 	for i, f := range files {
+		if f.SHA256 == "" {
+			dirID, err := dirOf(f.Dir)
+			if err != nil {
+				return res, err
+			}
+			// A file_id means a full hash landed first; a fast hash must not sit beside it.
+			if _, err := q.Exec("UPDATE instance SET sha256_8kb = ?, size = ?, mtime = ?, last_seen = CURRENT_TIMESTAMP WHERE dir_id IS ? AND filename = ? AND file_id IS NULL",
+				f.SHA256_8KB, f.Size, FormatMtime(f.Mtime), dirID, f.Name); err != nil {
+				return res, err
+			}
+			continue
+		}
 		var fileID int64
 		err := q.QueryRow("SELECT id FROM file WHERE sha256 = ?", f.SHA256).Scan(&fileID)
 		switch err {
@@ -310,12 +341,9 @@ sha256_noexif_jpeg = CASE WHEN ? THEN ? ELSE sha256_noexif_jpeg END WHERE id = ?
 			return res, err
 		}
 
-		dirID, ok := dirs[f.Dir]
-		if !ok {
-			if dirID, err = GetOrCreatePath(q, f.Dir); err != nil {
-				return res, err
-			}
-			dirs[f.Dir] = dirID
+		dirID, err := dirOf(f.Dir)
+		if err != nil {
+			return res, err
 		}
 		mtime := FormatMtime(f.Mtime)
 		var instID int64
@@ -323,7 +351,7 @@ sha256_noexif_jpeg = CASE WHEN ? THEN ? ELSE sha256_noexif_jpeg END WHERE id = ?
 		switch err {
 		case nil:
 			res.Updated++
-			_, err = q.Exec("UPDATE instance SET file_id = ?, size = ?, mtime = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?", fileID, f.Size, mtime, instID)
+			_, err = q.Exec("UPDATE instance SET file_id = ?, sha256_8kb = NULL, size = ?, mtime = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?", fileID, f.Size, mtime, instID)
 		case sql.ErrNoRows:
 			k := newKey{dirID, f.Name}
 			if j, dup := added[k]; dup { // same resolved path twice in one batch: the last one wins

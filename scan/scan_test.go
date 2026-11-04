@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -295,7 +296,7 @@ func TestHashAll(t *testing.T) {
 	}
 	for _, workers := range []int{1, 3, 0} {
 		var got []string
-		for r := range HashAll(context.Background(), slices.Values(paths), workers, nil, nil) {
+		for r := range HashAll(context.Background(), slices.Values(paths), workers, false, nil, nil) {
 			if r.Err != nil {
 				t.Fatal(r.Err)
 			}
@@ -310,10 +311,10 @@ func TestHashAll(t *testing.T) {
 		}
 	}
 	// breaking out early must not hang
-	for range HashAll(context.Background(), slices.Values(paths), 2, func(int, string) {}, nil) {
+	for range HashAll(context.Background(), slices.Values(paths), 2, false, func(int, string) {}, nil) {
 		break
 	}
-	for range HashAll(context.Background(), slices.Values(paths), 0, nil, nil) {
+	for range HashAll(context.Background(), slices.Values(paths), 0, false, nil, nil) {
 		break
 	}
 
@@ -323,7 +324,7 @@ func TestHashAll(t *testing.T) {
 	many := slices.Repeat(paths, 300)
 	var ticks int
 	n := 0
-	for r := range HashAll(context.Background(), slices.Values(many), 0, nil, func(int, float64) { ticks++ }) {
+	for r := range HashAll(context.Background(), slices.Values(many), 0, false, nil, func(int, float64) { ticks++ }) {
 		if r.Err != nil {
 			t.Fatal(r.Err)
 		}
@@ -377,5 +378,26 @@ func TestWalkWarningsDoNotReachDefaultLogger(t *testing.T) {
 	}
 	if buf.Len() != 0 {
 		t.Fatalf("walk logged to the default logger: %q", buf.String())
+	}
+}
+
+func TestHashFileFast(t *testing.T) {
+	d := t.TempDir()
+	big := filepath.Join(d, "big.jpg")
+	os.WriteFile(big, bytes.Repeat([]byte("x"), headSize+1), 0o644)
+	var read atomic.Int64
+	r := hashFile(big, &read, true)
+	full := HashFile(big)
+	if r.Err != nil || r.Hashes.SHA256 != "" || r.Hashes.MD5 != "" || r.Hashes.NoExifJPEG != nil || r.Hashes.SHA256_8KB != full.Hashes.SHA256_8KB || r.Size != headSize+1 {
+		t.Errorf("fast = %+v, full = %+v", r, full)
+	}
+	if read.Load() != headSize {
+		t.Errorf("read %d bytes", read.Load())
+	}
+	// a file that fits in the head is read whole, so it gets every hash
+	small := filepath.Join(d, "small")
+	os.WriteFile(small, bytes.Repeat([]byte("x"), headSize), 0o644)
+	if r := hashFile(small, new(atomic.Int64), true); r.Err != nil || r.Hashes != HashFile(small).Hashes {
+		t.Errorf("small fast = %+v", r)
 	}
 }

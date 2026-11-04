@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -103,8 +104,8 @@ func TestInitSchema(t *testing.T) {
 	d := dbtest.New(t)
 	var n int
 	d.QueryRow("SELECT COUNT(*) FROM sqlite_master").Scan(&n)
-	if n != 43 { // 7 tables + 18 indexes + 6 autoindexes + 2 FTS tables, their 7 shadow tables, 3 triggers
-		t.Errorf("sqlite_master rows = %d, want 43", n)
+	if n != 44 { // 7 tables + 19 indexes + 6 autoindexes + 2 FTS tables, their 7 shadow tables, 3 triggers
+		t.Errorf("sqlite_master rows = %d, want 44", n)
 	}
 	var mode string
 	d.QueryRow("PRAGMA journal_mode").Scan(&mode)
@@ -648,7 +649,7 @@ func TestMigrateV7(t *testing.T) {
 	if err := d.Init(&out); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "schema v8") {
+	if !strings.Contains(out.String(), "schema v9") {
 		t.Errorf("no migration notice: %q", out.String())
 	}
 	if err := d.RequireSchema(); err != nil {
@@ -701,7 +702,7 @@ func TestUnhashedInstances(t *testing.T) {
 	if err != nil || len(groups) != 1 || len(groups[0].Locations) != 2 {
 		t.Fatalf("Duplicates = %+v, %v", groups, err)
 	}
-	if n, err := d.CountUnhashed("/m"); err != nil || n != 1 {
+	if n, err := d.CountUnhashed("/m", false); err != nil || n != 1 {
 		t.Errorf("CountUnhashed = %d, %v", n, err)
 	}
 	if rm, err := d.RemoveInstance("/m/c.bin"); err != nil || rm.Instances != 1 || rm.Files != 0 {
@@ -716,5 +717,134 @@ func TestUnhashedInstances(t *testing.T) {
 	}
 	if n, err := d.DeleteOrphanedFiles(); err != nil || n != 1 {
 		t.Errorf("DeleteOrphanedFiles = %d, %v", n, err)
+	}
+}
+
+// addFast records a fast-hashed instance under dir.
+func addFast(t *testing.T, d *db.DB, dir, name string, size int64, head string) {
+	t.Helper()
+	mtime := time.Unix(1700000000, 0)
+	if _, err := d.CommitDiscovered([]db.DiscoveredFile{{Dir: dir, Name: name, Size: size, Mtime: mtime}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.CommitScanBatch([]db.ScannedFile{{Dir: dir, Name: name, Size: size, Mtime: mtime, SHA256_8KB: head}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMigrateV8(t *testing.T) {
+	d := dbtest.New(t)
+	for _, q := range []string{"DROP INDEX idx_instance_fast", "ALTER TABLE instance DROP COLUMN sha256_8kb", "DELETE FROM schema_version", "INSERT INTO schema_version (version) VALUES (8)"} {
+		if _, err := d.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := d.RequireSchema(); err != db.ErrOutdatedSchema {
+		t.Errorf("RequireSchema on v8: %v", err)
+	}
+	var out strings.Builder
+	if err := d.Init(&out); err != nil || !strings.Contains(out.String(), "schema v9") {
+		t.Fatalf("Init: %v, %q", err, out.String())
+	}
+	if err := d.RequireSchema(); err != nil {
+		t.Error(err)
+	}
+	addFast(t, d, "/m", "a", 9000, "h")
+	var n int
+	if err := d.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_instance_fast'").Scan(&n); err != nil || n != 1 {
+		t.Errorf("index after migration: %d, %v", n, err)
+	}
+}
+
+func TestFastHashLifecycle(t *testing.T) {
+	d := dbtest.New(t)
+	addFast(t, d, "/m", "a", 9000, "h")
+	files, err := d.DirFiles("/m")
+	if r := files["a"]; err != nil || r.Hashed || !r.Fast {
+		t.Fatalf("DirFiles = %+v, %v", files, err)
+	}
+	if n, err := d.CountUnhashed("/m", true); err != nil || n != 0 {
+		t.Errorf("CountUnhashed skipping fast = %d, %v", n, err)
+	}
+	if n, err := d.CountUnhashed("/m", false); err != nil || n != 1 {
+		t.Errorf("CountUnhashed = %d, %v", n, err)
+	}
+	// a changed file loses its fast hash
+	if _, err := d.CommitDiscovered([]db.DiscoveredFile{{Dir: "/m", Name: "a", Size: 9001, Mtime: time.Unix(1700000001, 0)}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if files, _ := d.DirFiles("/m"); files["a"].Fast {
+		t.Error("fast hash survived a change")
+	}
+	// a full hash replaces it, and a late fast hash can't come back beside it
+	addFast(t, d, "/m", "a", 9000, "h")
+	full := db.ScannedFile{Dir: "/m", Name: "a", Size: 9000, Mtime: time.Unix(1700000000, 0), MD5: "m", SHA256: "s", SHA256_8KB: "h"}
+	if _, err := d.CommitScanBatch([]db.ScannedFile{full}); err != nil {
+		t.Fatal(err)
+	}
+	full.MD5, full.SHA256 = "", ""
+	if _, err := d.CommitScanBatch([]db.ScannedFile{full}); err != nil {
+		t.Fatal(err)
+	}
+	if files, _ := d.DirFiles("/m"); !files["a"].Hashed || files["a"].Fast {
+		t.Errorf("after full hash: %+v", files["a"])
+	}
+}
+
+func TestPotentialDuplicates(t *testing.T) {
+	d := dbtest.New(t)
+	if groups, err := d.PotentialDuplicates(nil, false); err != nil || len(groups) != 0 {
+		t.Fatalf("empty: %+v, %v", groups, err)
+	}
+	head := func(content string) string { // what dbtest.AddFile stores in file.sha256_8kb
+		var h string
+		if err := d.QueryRow("SELECT sha256_8kb FROM file WHERE filesize = ?", len(content)).Scan(&h); err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+	dbtest.AddFile(t, d, "/h/hashed1", "aaaa")
+	dbtest.AddFile(t, d, "/h/hashed2", "aaaa") // hashed+hashed alone: confirmed, not potential
+	dbtest.AddFile(t, d, "/h/other", "bbbbbb")
+	addFast(t, d, "/q", "matches-other", 6, head("bbbbbb")) // fast+hashed
+	addFast(t, d, "/q", "q1", 9000, "h1")                   // fast+fast
+	addFast(t, d, "/q/sub", "q2", 9000, "h1")
+	addFast(t, d, "/q", "other-size", 9001, "h1") // same head, other size
+	addFast(t, d, "/q", "other-head", 9000, "h2") // same size, other head
+	if _, err := d.CommitDiscovered([]db.DiscoveredFile{{Dir: "/q", Name: "unhashed", Size: 9000, Mtime: time.Unix(1700000000, 0)}}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	groups, err := d.PotentialDuplicates(nil, false)
+	if err != nil || len(groups) != 2 {
+		t.Fatalf("PotentialDuplicates = %+v, %v", groups, err)
+	}
+	if g := groups[0]; !slices.Equal(g.Locations, []string{"/q/q1", "/q/sub/q2"}) || len(g.Unverified) != 2 || g.Wasted != 9000 {
+		t.Errorf("fast+fast = %+v", g)
+	}
+	if g := groups[1]; !slices.Equal(g.Locations, []string{"/h/other", "/q/matches-other"}) || !slices.Equal(g.Unverified, []string{"/q/matches-other"}) {
+		t.Errorf("fast+hashed = %+v", g)
+	}
+
+	sub, _, _ := db.DirByPath(d, "/q/sub")
+	subTree, err := db.TreeIDs(d, sub, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if groups, err := d.PotentialDuplicates(subTree, false); err != nil || len(groups) != 1 || len(groups[0].Locations) != 2 {
+		t.Errorf("filter = %+v, %v", groups, err)
+	}
+	if groups, err := d.PotentialDuplicates(subTree, true); err != nil || len(groups) != 0 {
+		t.Errorf("within = %+v, %v", groups, err)
+	}
+
+	if fast, none, err := d.CountNotFullyHashed(nil, 0); err != nil || fast != 5 || none != 1 {
+		t.Errorf("CountNotFullyHashed = %d, %d, %v", fast, none, err)
+	}
+	if fast, none, err := d.CountNotFullyHashed(subTree, 0); err != nil || fast != 1 || none != 0 {
+		t.Errorf("CountNotFullyHashed in sub = %d, %d, %v", fast, none, err)
+	}
+	if fast, none, err := d.CountNotFullyHashed(nil, 9001); err != nil || fast != 1 || none != 0 {
+		t.Errorf("CountNotFullyHashed min size = %d, %d, %v", fast, none, err)
 	}
 }

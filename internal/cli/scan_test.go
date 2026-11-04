@@ -315,3 +315,102 @@ func TestScanErrorsListed(t *testing.T) {
 		t.Errorf("stderr: %q", errOut)
 	}
 }
+
+func TestScanFastThenDuplicates(t *testing.T) {
+	h, d, tree := scanHarness(t)
+	big := strings.Repeat("x", 9000)
+	a, b, c := filepath.Join(tree, "a"), filepath.Join(tree, "b"), filepath.Join(tree, "c")
+	longer := filepath.Join(tree, "longer")
+	writeFile(t, a, big)
+	writeFile(t, b, big)
+	writeFile(t, c, big[:8999]+"y") // same size and head, other tail
+	writeFile(t, longer, big+"x")
+	writeFile(t, filepath.Join(tree, "small1"), "tiny") // read whole, so confirmed at once
+	writeFile(t, filepath.Join(tree, "small2"), "tiny")
+
+	out := h.mustRun("scan", "--fast", tree)
+	if !strings.Contains(out, "Fast-hashing 6 file(s)...") {
+		t.Errorf("no fast header:\n%s", out)
+	}
+	if n := count(t, d, "file"); n != 1 {
+		t.Errorf("file rows = %d, want the small file only", n)
+	}
+	if out := h.mustRun("find", "longer", tree); !strings.Contains(out, "longer") {
+		t.Errorf("not findable: %s", out)
+	}
+	wantLines(t, h.mustRun("scan", "--fast", tree), "Files processed: 0", "Files skipped: 6")
+
+	out = h.mustRun("duplicates")
+	wantLines(t, out,
+		"Found 1 sets of duplicate files:",
+		"Found 1 sets of potential duplicates (same size and first 8 KB, not fully hashed):",
+		"1. File size: 8.79 KiB (3 instances)",
+		"     "+c,
+		"4 files not fully hashed (4 fast-hashed, 0 unhashed). Confirm potential duplicates with --full-hash-potential, or hash everything with `fileindex scan`.",
+	)
+	if strings.Contains(out, longer) {
+		t.Errorf("different size listed as potential:\n%s", out)
+	}
+	if n := count(t, d, "file"); n != 1 {
+		t.Errorf("duplicates hashed without -f: %d file rows", n)
+	}
+
+	// --min-size leaves the potential set out of what -f hashes
+	if out := h.mustRun("duplicates", "-f", "--min-size", "1M"); strings.Contains(out, "Hashing") || !strings.Contains(out, "No duplicate files found") {
+		t.Errorf("-f --min-size hashed:\n%s", out)
+	}
+
+	out = h.mustRun("duplicates", "-f")
+	wantLines(t, out,
+		"Hashing 3 potential duplicate file(s)...",
+		"Found 2 sets of duplicate files:",
+		"     "+a,
+		"     "+b,
+		"1 files not fully hashed (1 fast-hashed, 0 unhashed). Hash them with `fileindex scan`.",
+	)
+	if strings.Contains(out, "potential duplicates (") || strings.Contains(out, c+"\n") || strings.Contains(out, longer) {
+		t.Errorf("-f output:\n%s", out)
+	}
+
+	h.mustRun("scan", tree) // a plain scan finishes the job
+	if strings.Contains(h.mustRun("duplicates"), "not fully hashed") {
+		t.Error("files left unhashed by a plain scan")
+	}
+	files := count(t, d, "file")
+	h.mustRun("scan", "--fast", tree) // never downgrades a full hash
+	if n := count(t, d, "file"); n != files {
+		t.Errorf("file rows %d -> %d", files, n)
+	}
+}
+
+func TestDuplicatesReportsUnhashed(t *testing.T) {
+	h, _, tree := scanHarness(t)
+	writeFile(t, filepath.Join(tree, "a"), "aa")
+	h.mustRun("scan", "--no-hash", tree)
+	wantLines(t, h.mustRun("duplicates"), "No duplicate files found",
+		"1 files not fully hashed (0 fast-hashed, 1 unhashed). Hash them with `fileindex scan`.")
+}
+
+func TestDuplicatesFullHashReportsErrors(t *testing.T) {
+	h, _, tree := scanHarness(t)
+	big := strings.Repeat("x", 9000)
+	a, b := filepath.Join(tree, "a"), filepath.Join(tree, "b")
+	writeFile(t, a, big)
+	writeFile(t, b, big)
+	h.mustRun("scan", "-f", tree)
+	os.Remove(a)
+	code, out, errOut := h.run("duplicates", "-f")
+	// the file that could not be hashed stays potential
+	if code != 0 || !strings.Contains(errOut, "File not found: "+a) || !strings.Contains(out, "Found 1 sets of potential duplicates") {
+		t.Errorf("exit %d\nstdout: %s\nstderr: %s", code, out, errOut)
+	}
+}
+
+func TestScanFastRejectsAllAndNoHash(t *testing.T) {
+	h, _, tree := scanHarness(t)
+	for _, flag := range []string{"--all", "--no-hash"} {
+		if code, _, errOut := h.run("scan", "--fast", flag, tree); code != 2 || !strings.Contains(errOut, "--fast cannot be combined") {
+			t.Errorf("%s: exit %d, %q", flag, code, errOut)
+		}
+	}
+}

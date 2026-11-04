@@ -3,6 +3,7 @@ package scan
 import (
 	"context"
 	"fmt"
+	"iter"
 	"os"
 	"path/filepath"
 	"slices"
@@ -25,6 +26,7 @@ type Options struct {
 	Workers     int  // hash workers; 0 = auto-scale
 	MissingOnly bool // skip files indexed and hashed with the same size and mtime (the CLI's default; --all turns it off)
 	SkipHash    bool // index and prune only: new and changed files stay unhashed, findable by name, until a later run hashes them
+	Fast        bool // hash only the first 8 KB of files larger than that; they stay unhashed until a later run without Fast
 	BatchFiles  int  // files per commit; 0 = 1000. Smaller batches make a cancel land sooner.
 	// BatchInterval, when > 0, commits a batch once this long has passed since its
 	// first file instead of after BatchFiles files. Every commit flushes the
@@ -98,6 +100,8 @@ func ResolveRoots(args []string) ([]string, error) {
 // names leave the index before any hashing. Phase 2 hashes every unhashed
 // instance under the roots, including ones left by an interrupted or SkipHash
 // run, and commits batches in the background. SkipHash stops after pruning.
+// Fast stores only a first-8-KB hash on the instance, skipping instances that
+// have one; an instance with a full hash is never touched.
 // A cancel in any stage skips the later ones.
 //
 // A file that changes between the walk and hashing is stored with the size and
@@ -150,7 +154,7 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 	if !res.Interrupted {
 		toHash := 0 // counted after pruning, so pruned rows are not in it
 		for _, sc := range scopes {
-			n, err := d.CountUnhashed(sc)
+			n, err := d.CountUnhashed(sc, opt.Fast)
 			if err != nil {
 				return res, err
 			}
@@ -299,7 +303,7 @@ walk:
 				}
 				if rec, ok := recorded[filepath.Base(p)]; ok && rec.Same(fi.Size(), fi.ModTime()) {
 					write = false // unchanged: nothing to write
-					if rec.Hashed {
+					if rec.Hashed || (opt.Fast && rec.Fast) {
 						res.Skipped++
 					} else {
 						found++ // waits for phase 2
@@ -345,15 +349,13 @@ func within(dir, p string) bool {
 const hashPage = 1000
 
 // hashPending is phase 2: it hashes the unhashed instances under scopes, paging
-// through them by id, and commits batches in the background while the next
-// one is hashed; otherwise every commit stalls all workers, which shows with
-// many small files.
+// through them by id.
 func hashPending(ctx context.Context, d *db.DB, opt Options, maxFiles int, scopes []string, r Reporter, res *Stats) error {
 	var pageErr error
 	paths := func(yield func(string) bool) {
 		for _, sc := range scopes {
 			for after := int64(0); ; {
-				page, err := d.UnhashedUnder(sc, after, hashPage)
+				page, err := d.UnhashedUnder(sc, after, hashPage, opt.Fast)
 				if err != nil {
 					pageErr = err
 					return
@@ -370,7 +372,24 @@ func hashPending(ctx context.Context, d *db.DB, opt Options, maxFiles int, scope
 			}
 		}
 	}
+	if err := hashPaths(ctx, d, opt, maxFiles, paths, r.Worker, r.Speed, res); err != nil {
+		return err
+	}
+	return pageErr
+}
 
+// HashPaths fully hashes the given indexed files and records them. Per-file
+// problems and a cancel land in the returned Stats, as in Run.
+func HashPaths(ctx context.Context, d *db.DB, paths []string, workers int, onStart func(int, string), onTick func(int, float64)) (Stats, error) {
+	var res Stats
+	err := hashPaths(ctx, d, Options{Workers: workers}, batchFiles, slices.Values(paths), onStart, onTick, &res)
+	return res, err
+}
+
+// hashPaths hashes paths and commits batches in the background while the next
+// one is hashed; otherwise every commit stalls all workers, which shows with
+// many small files.
+func hashPaths(ctx context.Context, d *db.DB, opt Options, maxFiles int, paths iter.Seq[string], onStart func(int, string), onTick func(int, float64), res *Stats) error {
 	type committed struct {
 		batch []db.ScannedFile
 		res   db.BatchResult
@@ -412,7 +431,7 @@ func hashPending(ctx context.Context, d *db.DB, opt Options, maxFiles int, scope
 	// an error return must not leave a commit running against d
 	defer func() { _ = wait() }()
 
-	for h := range HashAll(ctx, paths, opt.Workers, r.Worker, r.Speed) {
+	for h := range HashAll(ctx, paths, opt.Workers, opt.Fast, onStart, onTick) {
 		if h.Err != nil { // errors go to the list only, not the log too
 			res.Errored++
 			res.Errors = append(res.Errors, h.Err.Error())
@@ -425,9 +444,13 @@ func hashPending(ctx context.Context, d *db.DB, opt Options, maxFiles int, scope
 			Dir: filepath.Dir(h.Path), Name: filepath.Base(h.Path), Size: h.Size, Mtime: h.Mtime,
 			MD5: h.Hashes.MD5, SHA256: h.Hashes.SHA256, SHA256_8KB: h.Hashes.SHA256_8KB, NoExifJPEG: h.Hashes.NoExifJPEG,
 		})
+		read := h.Size
+		if h.Hashes.SHA256 == "" { // fast: only the head was read
+			read = min(read, headSize)
+		}
 		res.Processed++
-		res.TotalSize += h.Size
-		batchSize += h.Size
+		res.TotalSize += read
+		batchSize += read
 		full := len(batch) >= maxFiles
 		if opt.BatchInterval > 0 {
 			full = time.Since(batchStart) >= opt.BatchInterval
@@ -442,10 +465,7 @@ func hashPending(ctx context.Context, d *db.DB, opt Options, maxFiles int, scope
 	if err := commit(); err != nil {
 		return err
 	}
-	if err := wait(); err != nil {
-		return err
-	}
-	return pageErr
+	return wait()
 }
 
 // ownFiles reports whether a walked path is the database at dbPath or one of

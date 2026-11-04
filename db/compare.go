@@ -3,6 +3,7 @@ package db
 import (
 	"cmp"
 	"database/sql"
+	"encoding/json"
 	"path/filepath"
 	"slices"
 )
@@ -66,6 +67,8 @@ type DupGroup struct {
 	Size      int64 // smallest instance size
 	Wasted    int64 // total size minus the largest copy
 	Locations []string
+	// Unverified are the Locations that are only fast-hashed (PotentialDuplicates).
+	Unverified []string
 }
 
 // Duplicates ignores unhashed instances. It returns content groups with 2+ instances, biggest first. With a
@@ -73,15 +76,63 @@ type DupGroup struct {
 // with within, only if all are. Instances are read as rows, so names with
 // "; " are safe.
 func (d *DB) Duplicates(filter []int64, within bool) ([]DupGroup, error) {
-	rows, err := d.Query(`WITH grp AS (
+	return d.dupGroups(`WITH grp AS (
     SELECT COALESCE(f.sha256_noexif_jpeg, f.sha256) AS h
     FROM file f JOIN instance i ON f.id = i.file_id
     WHERE f.filesize > 0
     GROUP BY h HAVING COUNT(i.id) > 1
 )
-SELECT COALESCE(f.sha256_noexif_jpeg, f.sha256), f.filesize, i.dir_id, i.filename
+SELECT COALESCE(f.sha256_noexif_jpeg, f.sha256), f.filesize, i.dir_id, i.filename, 0
 FROM file f JOIN instance i ON f.id = i.file_id
-WHERE COALESCE(f.sha256_noexif_jpeg, f.sha256) IN (SELECT h FROM grp)`)
+WHERE COALESCE(f.sha256_noexif_jpeg, f.sha256) IN (SELECT h FROM grp)`, filter, within)
+}
+
+// PotentialDuplicates returns the sets of 2+ instances with the same size and
+// first 8 KB where at least one is only fast-hashed, biggest first; filter and
+// within work as in Duplicates. A set with no fast-hashed member is left out:
+// its full hashes already say whether it is a duplicate.
+func (d *DB) PotentialDuplicates(filter []int64, within bool) ([]DupGroup, error) {
+	// Starts from the fast-hashed rows and looks hashed ones up by their keys (CROSS
+	// JOIN fixes that order), so its cost follows the number of fast-hashed files, not
+	// the size of the index. INDEXED BY because the planner otherwise picks
+	// idx_instance_file_id and reads every unhashed row, 700x slower on 500k of them.
+	return d.dupGroups(`WITH fast AS (
+    SELECT size, sha256_8kb AS head, dir_id, filename
+    FROM instance INDEXED BY idx_instance_fast WHERE file_id IS NULL AND sha256_8kb IS NOT NULL
+), inst AS (
+    SELECT size, head, dir_id, filename, 1 AS fast FROM fast
+    UNION ALL
+    SELECT i.size, k.head, i.dir_id, i.filename, 0
+    FROM (SELECT DISTINCT size, head FROM fast) k
+    CROSS JOIN file f ON f.sha256_8kb = k.head
+    CROSS JOIN instance i ON i.file_id = f.id AND i.size = k.size
+)
+SELECT size || ':' || head, size, dir_id, filename, fast
+FROM (SELECT *, COUNT(*) OVER (PARTITION BY size, head) AS n FROM inst)
+WHERE n > 1`, filter, within)
+}
+
+// CountNotFullyHashed counts the instances of at least minSize without a full
+// hash, inside filter's dirs (nil = everywhere): fast-hashed ones, and those
+// with no hash at all.
+func (d *DB) CountNotFullyHashed(filter []int64, minSize int64) (fast, none int, err error) {
+	q, args := "SELECT COUNT(*), COUNT(sha256_8kb) FROM instance WHERE file_id IS NULL AND size >= ?", []any{minSize}
+	if filter != nil {
+		ids, err := json.Marshal(filter)
+		if err != nil {
+			return 0, 0, err
+		}
+		q, args = q+" AND dir_id IN (SELECT value FROM json_each(?))", append(args, string(ids))
+	}
+	var total int
+	err = d.QueryRow(q, args...).Scan(&total, &fast)
+	return fast, total - fast, err
+}
+
+// dupGroups groups query's rows (key, size, dir_id, filename, fast) by key,
+// applies filter and within, and sorts the groups biggest first.
+func (d *DB) dupGroups(query string, filter []int64, within bool) ([]DupGroup, error) {
+	rows, err := d.Query(query)
 	if err != nil {
 		return nil, err
 	}
@@ -89,13 +140,14 @@ WHERE COALESCE(f.sha256_noexif_jpeg, f.sha256) IN (SELECT h FROM grp)`)
 		size int64
 		dir  int64
 		name string
+		fast bool
 	}
 	byHash := map[string][]inst{}
 	var order []string
 	for rows.Next() {
 		var h string
 		var in inst
-		if err := rows.Scan(&h, &in.size, &in.dir, &in.name); err != nil {
+		if err := rows.Scan(&h, &in.size, &in.dir, &in.name, &in.fast); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -143,6 +195,9 @@ WHERE COALESCE(f.sha256_noexif_jpeg, f.sha256) IN (SELECT h FROM grp)`)
 				return nil, err
 			}
 			g.Locations = append(g.Locations, p)
+			if in.fast {
+				g.Unverified = append(g.Unverified, p)
+			}
 		}
 		g.Wasted = total - largest
 		slices.Sort(g.Locations)

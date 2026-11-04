@@ -38,10 +38,15 @@ var afterHash = func(string) {}
 // HashFile hashes one file. It stats before and after hashing and reports the
 // file as changed if size or mtime moved, so stored size always matches the
 // hashes.
-func HashFile(path string) Result { return hashFile(path, new(atomic.Int64)) }
+func HashFile(path string) Result { return hashFile(path, new(atomic.Int64), false) }
 
-// hashFile is HashFile that adds bytes to read as they are read.
-func hashFile(path string, read *atomic.Int64) Result {
+// headSize is how much of a file sha256_8kb covers.
+const headSize = 8192
+
+// hashFile is HashFile that adds bytes to read as they are read. With fast, a
+// file larger than headSize gets only Hashes.SHA256_8KB; a smaller one is read
+// whole anyway, so it gets every hash.
+func hashFile(path string, read *atomic.Int64, fast bool) Result {
 	r := Result{Path: path}
 	before, err := os.Stat(path)
 	switch {
@@ -57,7 +62,11 @@ func hashFile(path string, read *atomic.Int64) Result {
 	}
 	r.Size, r.Mtime = before.Size(), before.ModTime()
 
-	if r.Hashes, err = hashContent(path, read); err != nil {
+	hash := hashContent
+	if fast && before.Size() > headSize {
+		hash = hashHead
+	}
+	if r.Hashes, err = hash(path, read); err != nil {
 		if pe, ok := err.(*os.PathError); ok {
 			err = pe.Err // the path is already in the message
 		}
@@ -83,6 +92,29 @@ func (c countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// readHead reads up to headSize bytes; a shorter file is not an error.
+func readHead(r io.Reader) ([]byte, error) {
+	head := make([]byte, headSize)
+	n, err := io.ReadFull(r, head)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return nil, err
+	}
+	return head[:n], nil
+}
+
+func hashHead(path string, read *atomic.Int64) (Hashes, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return Hashes{}, err
+	}
+	defer file.Close()
+	head, err := readHead(countingReader{file, read})
+	if err != nil {
+		return Hashes{}, err
+	}
+	return Hashes{SHA256_8KB: sha256Hex(head)}, nil
+}
+
 func hashContent(path string, read *atomic.Int64) (Hashes, error) {
 	var h Hashes
 	file, err := os.Open(path)
@@ -98,7 +130,7 @@ func hashContent(path string, read *atomic.Int64) (Hashes, error) {
 		if err != nil {
 			return h, err
 		}
-		h.MD5, h.SHA256, h.SHA256_8KB = md5Hex(data), sha256Hex(data), sha256Hex(data[:min(len(data), 8192)])
+		h.MD5, h.SHA256, h.SHA256_8KB = md5Hex(data), sha256Hex(data), sha256Hex(data[:min(len(data), headSize)])
 		if stripped, err := StripJPEGMetadata(data); err == nil {
 			s := sha256Hex(stripped)
 			h.NoExifJPEG = &s
@@ -110,16 +142,15 @@ func hashContent(path string, read *atomic.Int64) (Hashes, error) {
 
 	m, s := md5.New(), sha256.New()
 	w := io.MultiWriter(m, s)
-	head := make([]byte, 8192)
-	n, err := io.ReadFull(f, head)
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+	head, err := readHead(f)
+	if err != nil {
 		return h, err
 	}
-	_, _ = w.Write(head[:n]) // hash writers never fail
+	_, _ = w.Write(head) // hash writers never fail
 	if _, err := io.Copy(w, f); err != nil {
 		return h, err
 	}
-	h.MD5, h.SHA256, h.SHA256_8KB = hex.EncodeToString(m.Sum(nil)), hex.EncodeToString(s.Sum(nil)), sha256Hex(head[:n])
+	h.MD5, h.SHA256, h.SHA256_8KB = hex.EncodeToString(m.Sum(nil)), hex.EncodeToString(s.Sum(nil)), sha256Hex(head)
 	return h, nil
 }
 
@@ -138,8 +169,8 @@ const holdTicks = 5
 // onStart, if set, is called from worker goroutines as (worker id 1..N, path);
 // onTick, if set, is called every tick as (workers, bytes/s). The caller
 // serialises any output. Stopping the iteration or cancelling ctx stops the
-// walk and workers.
-func HashAll(ctx context.Context, paths iter.Seq[string], workers int, onStart func(int, string), onTick func(int, float64)) iter.Seq[Result] {
+// walk and workers. fast is as in hashFile.
+func HashAll(ctx context.Context, paths iter.Seq[string], workers int, fast bool, onStart func(int, string), onTick func(int, float64)) iter.Seq[Result] {
 	return func(yield func(Result) bool) {
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -180,7 +211,7 @@ func HashAll(ctx context.Context, paths iter.Seq[string], workers int, onStart f
 						onStart(id, p)
 					}
 					select {
-					case out <- hashFile(p, &read):
+					case out <- hashFile(p, &read, fast):
 					case <-ctx.Done():
 						return
 					}

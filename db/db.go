@@ -1,4 +1,4 @@
-// Package db holds the schema v8 SQLite index and every query on it.
+// Package db holds the schema v9 SQLite index and every query on it.
 //
 // Read TIMESTAMP columns (mtime, created_at, last_seen) as CAST(col AS TEXT):
 // the driver otherwise parses them into time.Time and reformats them.
@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const SchemaVersion = 8
+const SchemaVersion = 9
 
 // Querier is satisfied by *sql.DB and *sql.Tx, so helpers can run inside a caller's transaction.
 type Querier interface {
@@ -116,12 +116,13 @@ CREATE INDEX idx_file_tag_tag_id ON file_tag(tag_id);
 CREATE INDEX idx_file_tag_instance_id ON file_tag(instance_id);
 CREATE INDEX idx_dir_tag_tag_id ON dir_tag(tag_id);
 CREATE INDEX idx_dir_tag_dir_id ON dir_tag(dir_id);
-` + instanceIndexes + ftsSchema + `INSERT INTO schema_version (version) VALUES (8);
+` + instanceIndexes + ftsSchema + `INSERT INTO schema_version (version) VALUES (9);
 `
 
 // instanceDDL is the instance table under the given name. file_id is NULL while
 // the file is not hashed yet (it is already listed and found by name); size is
 // the size seen at the last walk or hash, so listings never need the file row.
+// sha256_8kb is set on a fast-hashed instance, which has no file row to hold it.
 func instanceDDL(name string) string {
 	return `CREATE TABLE ` + name + ` (
     id INTEGER PRIMARY KEY,
@@ -131,6 +132,7 @@ func instanceDDL(name string) string {
     filename_lower TEXT NOT NULL,
     size INTEGER NOT NULL,
     mtime TIMESTAMP,
+    sha256_8kb TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (file_id) REFERENCES file(id) ON DELETE SET NULL,
@@ -145,6 +147,11 @@ CREATE INDEX idx_instance_filename ON instance(filename);
 CREATE INDEX idx_instance_filename_lower ON instance(filename_lower);
 CREATE INDEX idx_instance_file_id ON instance(file_id);
 CREATE INDEX idx_instance_mtime ON instance(mtime);
+` + fastIndex
+
+// fastIndex serves PotentialDuplicates. It is partial, so instances without a
+// fast hash cost nothing.
+const fastIndex = `CREATE INDEX idx_instance_fast ON instance(size, sha256_8kb) WHERE file_id IS NULL AND sha256_8kb IS NOT NULL;
 `
 
 // ftsSchema adds two external-content FTS5 indexes over instance.filename, kept
@@ -181,7 +188,13 @@ INSERT INTO instance_words(instance_words) VALUES ('rebuild');
 INSERT INTO schema_version (version) VALUES (7);
 `
 
-// migrateV7 rebuilds instance for schema v8 (SQLite cannot drop NOT NULL in
+// migrateV8 adds the fast hash column and its index.
+const migrateV8 = `ALTER TABLE instance ADD COLUMN sha256_8kb TEXT;
+` + fastIndex + `INSERT INTO schema_version (version) VALUES (9);
+`
+
+// migrateV7 rebuilds instance for the current schema, going straight to v9 since
+// instanceDDL already has v9's column (SQLite cannot drop NOT NULL in
 // place): file_id becomes nullable and size is copied from the file row. Ids are
 // kept, so file_tag rows and the external-content FTS indexes stay valid and
 // need no rebuild. It runs on one connection with foreign keys off, because
@@ -208,7 +221,7 @@ SELECT i.id, i.file_id, i.dir_id, i.filename, i.filename_lower, f.filesize, i.mt
 FROM instance i JOIN file f ON f.id = i.file_id;
 DROP TABLE instance;
 ALTER TABLE instance_new RENAME TO instance;
-` + instanceIndexes + ftsTriggers + `INSERT INTO schema_version (version) VALUES (8);`); err != nil {
+` + instanceIndexes + ftsTriggers + `INSERT INTO schema_version (version) VALUES (9);`); err != nil {
 		return err
 	}
 	var bad int
@@ -216,14 +229,14 @@ ALTER TABLE instance_new RENAME TO instance;
 		return err
 	}
 	if bad > 0 {
-		return fmt.Errorf("Migration to schema v8 left %d foreign key violations", bad)
+		return fmt.Errorf("Migration to schema v9 left %d foreign key violations", bad)
 	}
 	return tx.Commit()
 }
 
-// Init switches to WAL, then checks the schema version, migrates a v6 or v7 DB
+// Init switches to WAL, then checks the schema version, migrates a v6, v7 or v8 DB
 // (announced on w, since rebuilding the FTS indexes takes minutes on millions
-// of instances) or creates schema v8.
+// of instances) or creates schema v9.
 // It is the only place that changes the journal mode or creates tables.
 func (d *DB) Init(w io.Writer) error {
 	if _, err := d.Exec("PRAGMA journal_mode = WAL"); err != nil {
@@ -250,8 +263,11 @@ func (d *DB) Init(w io.Writer) error {
 		case v.Valid && v.Int64 == SchemaVersion:
 			return nil
 		case v.Valid && v.Int64 == 7:
-			fmt.Fprintln(w, "Migrating database to schema v8 (files indexed before hashing)...")
+			fmt.Fprintln(w, "Migrating database to schema v9 (files indexed before hashing, fast hashes)...")
 			return d.migrateV7()
+		case v.Valid && v.Int64 == 8:
+			fmt.Fprintln(w, "Migrating database to schema v9 (fast hashes)...")
+			return d.execTx(migrateV8)
 		default:
 			found := "None"
 			if v.Valid {

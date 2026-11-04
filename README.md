@@ -28,6 +28,8 @@ Other commands: `diff`, `ls`, `tree`, `mv`, `remove`, `tag`/`tags`/`find-tagged`
 
 `scan` works in two phases. First it walks the paths and records every new or changed file (name, size, mtime) right away, in batches, so `find`, `ls` and `tree` see it before any hashing happens. Next it prunes records of files and dirs that are gone from disk, so stale names disappear before any hashing starts. Last it hashes the files that are not hashed yet; duplicates, `match`, `diff` and `verify` only use hashed files. An interrupted scan resumes hashing on the next run without the files having to change, and a file whose size or mtime changed is unhashed again until it is rehashed. `scan --no-hash` stops after the walk and pruning, leaving the files unhashed until a later scan. `export` skips unhashed files.
 
+`scan --fast` (`-f`) hashes only the first 8 KB of files larger than that, so a big tree is done in a fraction of the time. Those files stay unhashed until a later plain `scan` hashes them fully. `duplicates` lists files with the same size and first 8 KB as potential duplicates, and counts the files not fully hashed; `duplicates -f` fully hashes just the potential ones to confirm or rule them out. Re-tagged JPEGs differ in their first 8 KB, so only a full scan finds those.
+
 ## Configuration
 
 `~/.config/fileindex/config.ini`, created on first run. Controls which files to scan (default `*`, i.e. all; narrow with e.g. `*.jpg,*.mkv`), excluded dirs/files, worker count and database path (default `~/.local/share/fileindex/index.sqlite`). Any option can be overridden with `FILEINDEX_<SECTION>_<OPTION>`.
