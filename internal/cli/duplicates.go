@@ -164,7 +164,7 @@ func (a *app) hashPotential(d *db.DB, groups []db.DupGroup) error {
 	logPrint = func(w io.Writer, b []byte) { p.Print(w, b) }
 	defer func() { logPrint = prevLog }()
 	p.Hashing(len(paths))
-	st, err := scan.HashPaths(a.ctx, d, paths, workers, p.Worker, p.Speed)
+	st, err := scan.HashPaths(a.ctx, d, paths, workers, p.Worker, p.Speed, p.FileDone)
 	p.Clear()
 	if err != nil {
 		return err

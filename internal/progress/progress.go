@@ -29,8 +29,8 @@ type Progress struct {
 	bps                        float64 // < 0 = not measured yet
 	widths                     []int   // display width of each drawn line
 	pruning                    bool
-	hashing                    bool // hashing stage: a total and a started count instead of the scan lines
-	hashTotal, hashStarted     int
+	hashing                    bool // hashing stage: a total and a done count instead of the scan lines
+	hashTotal, hashDone        int
 	winch                      chan os.Signal
 	resizing                   bool // window resize in progress: hold redraws until it settles
 }
@@ -83,7 +83,14 @@ func (p *Progress) Worker(id int, path string) {
 	if id >= 1 && id <= len(p.workers) {
 		p.workers[id-1] = path
 	}
-	p.hashStarted++
+	p.redraw()
+}
+
+// FileDone counts one hashed file, failed ones too.
+func (p *Progress) FileDone() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.hashDone++
 	p.redraw()
 }
 
@@ -117,12 +124,12 @@ func (p *Progress) Prune(dir string, checked int) {
 	p.redraw()
 }
 
-// Hashing switches the block to hashing total files: files started so far and
+// Hashing switches the block to hashing total files: files done so far and
 // one line per worker.
 func (p *Progress) Hashing(total int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.hashing, p.hashTotal, p.hashStarted = true, total, 0
+	p.hashing, p.hashTotal, p.hashDone = true, total, 0
 	p.redraw()
 }
 
@@ -180,7 +187,7 @@ func (p *Progress) redraw() {
 		lines = []string{labeled("Pruning: ", rel(p.dir, p.roots...), cols), fmt.Sprintf("Checked: %d", p.scanned)}
 	}
 	if p.hashing {
-		lines = []string{fmt.Sprintf("Hashing: %d of %d files started", p.hashStarted, p.hashTotal)}
+		lines = []string{fmt.Sprintf("Hashed: %d of %d files", p.hashDone, p.hashTotal)}
 	}
 	if p.newFiles > 0 && !p.hashing {
 		lines[1] += fmt.Sprintf(", New: %d", p.newFiles)

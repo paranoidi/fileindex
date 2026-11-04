@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -345,5 +346,26 @@ func TestRunSkipsOwnDatabase(t *testing.T) {
 	rows.Close()
 	if !slices.Equal(names, []string{"index.sqlite-backup", "kettle.txt"}) || st.Skipped < 1 {
 		t.Errorf("indexed %q, skipped %d", names, st.Skipped)
+	}
+}
+
+// doneRecorder counts FileDone calls.
+type doneRecorder struct {
+	recorder
+	done atomic.Int32
+}
+
+func (r *doneRecorder) FileDone() { r.done.Add(1) }
+
+// Run reports each hashed file once through FileReporter.
+func TestRunReportsFileDone(t *testing.T) {
+	d, tree := newIndex(t)
+	write(t, tree, "a/one.jpg", "a/two.jpg", "b/three.jpg")
+	rec := &doneRecorder{}
+	if _, err := scan.Run(context.Background(), d, []string{tree}, scan.Options{}, rec); err != nil {
+		t.Fatal(err)
+	}
+	if n := rec.done.Load(); n != 3 {
+		t.Errorf("FileDone called %d times, want 3", n)
 	}
 }

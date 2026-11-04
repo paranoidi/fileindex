@@ -45,6 +45,10 @@ type Reporter interface {
 	Log(msg string)                                  // a removal made by pruning
 }
 
+// FileReporter is an optional extension of Reporter: FileDone is called, from
+// Run's hashing loop, once per file whose hashing finished or failed.
+type FileReporter interface{ FileDone() }
+
 // PhaseReporter is an optional extension of Reporter: a Reporter that also
 // implements it can tell Run's three stages apart. The calls, in order:
 // Scan and Indexed while walking, Discovered, Prune and Log while pruning,
@@ -372,7 +376,11 @@ func hashPending(ctx context.Context, d *db.DB, opt Options, maxFiles int, scope
 			}
 		}
 	}
-	if err := hashPaths(ctx, d, opt, maxFiles, paths, r.Worker, r.Speed, res); err != nil {
+	var onDone func()
+	if fr, ok := r.(FileReporter); ok {
+		onDone = fr.FileDone
+	}
+	if err := hashPaths(ctx, d, opt, maxFiles, paths, r.Worker, r.Speed, onDone, res); err != nil {
 		return err
 	}
 	return pageErr
@@ -380,16 +388,16 @@ func hashPending(ctx context.Context, d *db.DB, opt Options, maxFiles int, scope
 
 // HashPaths fully hashes the given indexed files and records them. Per-file
 // problems and a cancel land in the returned Stats, as in Run.
-func HashPaths(ctx context.Context, d *db.DB, paths []string, workers int, onStart func(int, string), onTick func(int, float64)) (Stats, error) {
+func HashPaths(ctx context.Context, d *db.DB, paths []string, workers int, onStart func(int, string), onTick func(int, float64), onDone func()) (Stats, error) {
 	var res Stats
-	err := hashPaths(ctx, d, Options{Workers: workers}, batchFiles, slices.Values(paths), onStart, onTick, &res)
+	err := hashPaths(ctx, d, Options{Workers: workers}, batchFiles, slices.Values(paths), onStart, onTick, onDone, &res)
 	return res, err
 }
 
 // hashPaths hashes paths and commits batches in the background while the next
 // one is hashed; otherwise every commit stalls all workers, which shows with
 // many small files.
-func hashPaths(ctx context.Context, d *db.DB, opt Options, maxFiles int, paths iter.Seq[string], onStart func(int, string), onTick func(int, float64), res *Stats) error {
+func hashPaths(ctx context.Context, d *db.DB, opt Options, maxFiles int, paths iter.Seq[string], onStart func(int, string), onTick func(int, float64), onDone func(), res *Stats) error {
 	type committed struct {
 		batch []db.ScannedFile
 		res   db.BatchResult
@@ -432,6 +440,9 @@ func hashPaths(ctx context.Context, d *db.DB, opt Options, maxFiles int, paths i
 	defer func() { _ = wait() }()
 
 	for h := range HashAll(ctx, paths, opt.Workers, opt.Fast, onStart, onTick) {
+		if onDone != nil {
+			onDone()
+		}
 		if h.Err != nil { // errors go to the list only, not the log too
 			res.Errored++
 			res.Errors = append(res.Errors, h.Err.Error())
