@@ -519,12 +519,7 @@ type newKey struct {
 func (d *DB) DeleteInstancesInTree(id int64) (int64, error) { return deleteInstancesInTree(d, id) }
 
 func deleteInstancesInTree(q Querier, id int64) (int64, error) {
-	ids, err := TreeIDs(q, &id, true)
-	if err != nil || len(ids) == 0 {
-		return 0, err
-	}
-	in, args := InList(ids)
-	r, err := q.Exec("DELETE FROM instance WHERE dir_id IN ("+in+")", args...)
+	r, err := q.Exec(treeCTE+"DELETE FROM instance WHERE dir_id IN (SELECT id FROM dir_tree)", id)
 	if err != nil {
 		return 0, err
 	}

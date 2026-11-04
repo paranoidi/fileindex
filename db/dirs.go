@@ -272,8 +272,7 @@ func recordDirs(tx Querier, paths []string) error {
 // and dirs removed. Instances go first and explicitly so their FTS triggers run;
 // subdirs and dir_tag rows go by ON DELETE CASCADE.
 func deleteTree(q Querier, id int64) (files, dirs int64, err error) {
-	ids, err := TreeIDs(q, &id, true)
-	if err != nil || len(ids) == 0 {
+	if err := q.QueryRow(treeCTE+"SELECT COUNT(*) FROM dir_tree", id).Scan(&dirs); err != nil || dirs == 0 {
 		return 0, 0, err
 	}
 	if files, err = deleteInstancesInTree(q, id); err != nil {
@@ -282,5 +281,5 @@ func deleteTree(q Querier, id int64) (files, dirs int64, err error) {
 	if _, err := q.Exec("DELETE FROM dir WHERE id = ?", id); err != nil {
 		return files, 0, err
 	}
-	return files, int64(len(ids)), nil
+	return files, dirs, nil
 }

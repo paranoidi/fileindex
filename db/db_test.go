@@ -1074,3 +1074,29 @@ func TestUnhashedPages(t *testing.T) {
 		t.Fatalf("unknown path: %v, %v", pages, err)
 	}
 }
+
+// A tree with more dirs than SQLite takes bound variables (32766) must still go.
+func TestRemoveHugeTree(t *testing.T) {
+	const dirs = 40000
+	d := dbtest.New(t)
+	dbtest.AddFile(t, d, "/keep/k", "k")
+	dbtest.AddFile(t, d, "/big/a/f", "f")
+	id, _, err := db.DirByPath(d, "/big/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(`WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < ?)
+INSERT INTO dir (parent_id, name, name_lower) SELECT ?, 'd' || i, 'd' || i FROM s`, dirs, *id); err != nil {
+		t.Fatal(err)
+	}
+	r, err := d.RemoveTree("/big/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Instances != 1 || r.Files != 1 || r.Dirs != dirs+2 { // the subdirs, /big/a, and /big left empty
+		t.Errorf("RemoveTree = %+v", r)
+	}
+	if files, err := d.DirFiles("/keep"); err != nil || len(files) != 1 {
+		t.Errorf("/keep = %v, %v", files, err)
+	}
+}
