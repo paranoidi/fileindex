@@ -33,10 +33,15 @@ type Progress struct {
 	hashTotal, hashDone        int
 	winch                      chan os.Signal
 	resizing                   bool // window resize in progress: hold redraws until it settles
+	drawn                      time.Time
 }
 
 // resizeSettle is how long the window size must stay put before redrawing.
 const resizeSettle = 150 * time.Millisecond
+
+// redrawEvery limits per-file updates: a draw costs an ioctl, path fitting and a
+// tty write under the mutex the hash workers share.
+const redrawEvery = 50 * time.Millisecond
 
 func NewProgress(out io.Writer, workers int, roots []string, quiet bool) *Progress {
 	p := &Progress{out: out, roots: roots, workers: make([]string, max(workers, 0)), bps: -1}
@@ -105,7 +110,7 @@ func (p *Progress) Speed(workers int, bps float64) {
 	for len(p.workers) < workers {
 		p.workers = append(p.workers, "")
 	}
-	p.redraw()
+	p.draw() // every tick: shows any worker update the throttle skipped
 }
 
 // Scan updates the discovery line; dir "" means idle.
@@ -120,7 +125,12 @@ func (p *Progress) Scan(dir string, scanned, newFiles, skipped int) {
 func (p *Progress) Prune(dir string, checked int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	first := !p.pruning
 	p.pruning, p.dir, p.scanned = true, dir, checked
+	if first {
+		p.draw()
+		return
+	}
 	p.redraw()
 }
 
@@ -130,7 +140,7 @@ func (p *Progress) Hashing(total int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.hashing, p.hashTotal, p.hashDone = true, total, 0
-	p.redraw()
+	p.draw()
 }
 
 // rel shows a path relative to the first base containing it.
@@ -174,10 +184,18 @@ func (p *Progress) up(cols int) string {
 	return fmt.Sprintf("\x1b[%dA", rows)
 }
 
+// redraw draws unless the last draw was under redrawEvery ago.
 func (p *Progress) redraw() {
+	if time.Since(p.drawn) >= redrawEvery {
+		p.draw()
+	}
+}
+
+func (p *Progress) draw() {
 	if !p.active || p.resizing {
 		return
 	}
+	p.drawn = time.Now()
 	cols := p.cols()
 	lines := []string{"Scanning: [idle]", fmt.Sprintf("Scanned: %d", p.scanned)}
 	if p.dir != "" {
@@ -230,7 +248,7 @@ func (p *Progress) Print(w io.Writer, b []byte) {
 		io.WriteString(p.out, up+"\r\x1b[J")
 	}
 	_, _ = w.Write(b)
-	p.redraw()
+	p.draw() // the block was just erased
 }
 
 // Clear blanks the block, leaves the cursor at its top and stops further drawing.

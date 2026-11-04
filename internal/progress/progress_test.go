@@ -1,6 +1,7 @@
 package progress
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
@@ -43,5 +44,23 @@ func TestFitPath(t *testing.T) {
 		if got := fitPath("/", w); got != want {
 			t.Errorf("fitPath(/, %d) = %q", w, got)
 		}
+	}
+}
+
+// Per-file updates must not each draw; a forced draw still shows the latest state.
+func TestRedrawThrottled(t *testing.T) {
+	var out bytes.Buffer
+	p := NewProgress(&out, 0, nil, false)
+	p.active = true
+	p.fd = -1 // cols falls back to 80
+	for i := range 1000 {
+		p.Scan("/d", i+1, 0, 0)
+	}
+	if n := strings.Count(out.String(), "Scanned: "); n > 5 {
+		t.Fatalf("1000 updates drew %d times", n)
+	}
+	p.Speed(0, 0)
+	if !strings.Contains(out.String(), "Scanned: 1000") {
+		t.Fatalf("forced draw lost the latest count: %q", out.String())
 	}
 }
