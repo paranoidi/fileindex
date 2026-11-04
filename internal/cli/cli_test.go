@@ -203,3 +203,33 @@ func TestVersion(t *testing.T) {
 		t.Fatalf("code=%d out=%q err=%q", code, out, errOut)
 	}
 }
+
+func TestInitAutocomplete(t *testing.T) {
+	h := newHarness(t)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("SHELL", "/usr/bin/fish")
+	out := h.mustRun("init", "--autocomplete")
+	path := filepath.Join(h.home, ".config", "fish", "completions", "fileindex.fish")
+	if !strings.Contains(out, path) {
+		t.Fatalf("output %q lacks %s", out, path)
+	}
+	if b, err := os.ReadFile(path); err != nil || !strings.Contains(string(b), "fileindex") {
+		t.Fatalf("script missing: %v", err)
+	}
+	if _, err := os.Stat(h.dbPath()); err == nil {
+		t.Fatal("--autocomplete must not create the database")
+	}
+	t.Setenv("SHELL", "/bin/tcsh")
+	if code, _, _ := h.run("init", "--autocomplete"); code != 1 {
+		t.Fatalf("unsupported shell: exit %d", code)
+	}
+}
+
+func TestInitNonInteractiveSkipsAutocomplete(t *testing.T) {
+	h := newHarness(t)
+	t.Setenv("SHELL", "/usr/bin/fish")
+	if out := h.mustRun("init", "--non-interactive"); strings.Contains(out, "registered") {
+		t.Fatalf("unexpected: %q", out)
+	}
+}

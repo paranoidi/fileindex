@@ -108,7 +108,6 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	root.SetArgs(args)
 	root.SetOut(stdout)
 	root.SetErr(stderr)
-	root.CompletionOptions.DisableDefaultCmd = true
 	root.PersistentFlags().StringVar(&configPath, "config", "", "Path to configuration file")
 	root.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose output")
 	root.Args = cobra.NoArgs

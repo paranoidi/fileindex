@@ -13,7 +13,9 @@ Pure Go (no CGO). Or `task build` / `task install`.
 ## Usage
 
 ```sh
-fileindex init                  # create config and database
+fileindex init                  # create config and database (offers shell autocomplete)
+fileindex init --autocomplete   # only register shell autocomplete (bash/zsh/fish)
+fileindex init --non-interactive # never prompt
 fileindex scan ~/Photos         # index files
 fileindex duplicates            # files with more than one copy
 fileindex match some/dir        # where else do these files exist?
