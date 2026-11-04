@@ -3,7 +3,9 @@ package db_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -845,5 +847,131 @@ func TestPotentialDuplicates(t *testing.T) {
 	}
 	if fast, none, err := d.CountNotFullyHashed(nil, 9001); err != nil || fast != 1 || none != 0 {
 		t.Errorf("CountNotFullyHashed min size = %d, %d, %v", fast, none, err)
+	}
+}
+
+func TestDuplicatesContentKeys(t *testing.T) {
+	d := dbtest.New(t)
+	mtime := time.Unix(1700000000, 0)
+	add := func(name, sha string, noexif *string) {
+		t.Helper()
+		f := db.ScannedFile{Dir: "/m", Name: name, Size: 10, Mtime: mtime, MD5: "md5" + sha, SHA256: sha, SHA256_8KB: "h", NoExifJPEG: noexif}
+		if res, err := d.CommitScanBatch([]db.ScannedFile{f}); err != nil || len(res.Failed) > 0 {
+			t.Fatalf("%s: %+v, %v", name, res, err)
+		}
+	}
+	stripped, shared, orphaned := "stripped", "shared", "orphaned"
+	add("photo.jpg", "with-exif", &stripped) // the same picture stored stripped under a non-JPEG name
+	add("photo.bin", "stripped", nil)
+	add("a.jpg", "a", &shared) // same no-EXIF hash, one instance each
+	add("b.jpg", "b", &shared)
+	add("c.bin", "c", nil) // one File, two instances
+	add("c-copy.bin", "c", nil)
+	add("unique.bin", "unique", nil)
+	add("gone.jpg", "gone", &orphaned) // shares a no-EXIF hash with a file row that lost its instance
+	add("kept.jpg", "kept", &orphaned)
+	if _, err := d.Exec("DELETE FROM instance WHERE filename = 'gone.jpg'"); err != nil {
+		t.Fatal(err)
+	}
+
+	groups, err := d.Duplicates(nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [][]string
+	for _, g := range groups {
+		got = append(got, g.Locations)
+	}
+	slices.SortFunc(got, slices.Compare)
+	want := [][]string{{"/m/a.jpg", "/m/b.jpg"}, {"/m/c-copy.bin", "/m/c.bin"}, {"/m/photo.bin", "/m/photo.jpg"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Duplicates = %v, want %v", got, want)
+	}
+}
+
+// Duplicates must agree with grouping every instance by its content key.
+func TestDuplicatesMatchesContentGrouping(t *testing.T) {
+	d := dbtest.New(t)
+	r := rand.New(rand.NewPCG(1, 2))
+	mtime := time.Unix(1700000000, 0)
+	var batch []db.ScannedFile
+	for i := range 500 {
+		sha := fmt.Sprintf("s%d", r.IntN(350)) // some files share content
+		name := fmt.Sprintf("f%d.bin", i)
+		var noexif *string
+		switch n := r.IntN(10); {
+		case n < 3: // a JPEG, which may share its no-EXIF hash
+			x := fmt.Sprintf("x%d", r.IntN(60))
+			noexif, name = &x, fmt.Sprintf("f%d.jpg", i)
+		case n == 3: // a stripped JPEG's content under a non-JPEG name
+			sha = fmt.Sprintf("x%d", r.IntN(60))
+		}
+		batch = append(batch, db.ScannedFile{Dir: fmt.Sprintf("/m/d%d", i%7), Name: name, Size: int64(r.IntN(5) + 1), Mtime: mtime,
+			MD5: "md5" + sha, SHA256: sha, SHA256_8KB: "h", NoExifJPEG: noexif})
+	}
+	if res, err := d.CommitScanBatch(batch); err != nil || len(res.Failed) > 0 {
+		t.Fatalf("%+v, %v", res, err)
+	}
+	if _, err := d.Exec("DELETE FROM instance WHERE id % 9 = 0"); err != nil { // leaves some file rows orphaned
+		t.Fatal(err)
+	}
+
+	rows, err := d.Query(`SELECT COALESCE(f.sha256_noexif_jpeg, f.sha256), i.dir_id, i.filename
+FROM file f JOIN instance i ON i.file_id = f.id WHERE f.filesize > 0`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirs := map[int64]string{}
+	byKey := map[string][]string{}
+	for rows.Next() {
+		var key, name string
+		var dir int64
+		if err := rows.Scan(&key, &dir, &name); err != nil {
+			t.Fatal(err)
+		}
+		byKey[key] = append(byKey[key], fmt.Sprintf("%d/%s", dir, name))
+		dirs[dir] = ""
+	}
+	rows.Close()
+	for id := range dirs {
+		var name string
+		if err := d.QueryRow("SELECT name FROM dir WHERE id = ?", id).Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		dirs[id] = "/m/" + name + "/"
+	}
+	var want [][]string
+	for _, insts := range byKey {
+		if len(insts) < 2 {
+			continue
+		}
+		var paths []string
+		for _, in := range insts {
+			var id int64
+			var name string
+			if _, err := fmt.Sscanf(in, "%d/%s", &id, &name); err != nil {
+				t.Fatal(err)
+			}
+			paths = append(paths, dirs[id]+name)
+		}
+		slices.Sort(paths)
+		want = append(want, paths)
+	}
+	slices.SortFunc(want, slices.Compare)
+	if len(want) == 0 {
+		t.Fatal("test data has no duplicates")
+	}
+
+	groups, err := d.Duplicates(nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [][]string
+	for _, g := range groups {
+		got = append(got, g.Locations)
+	}
+	slices.SortFunc(got, slices.Compare)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Duplicates = %v\nwant %v", got, want)
 	}
 }
