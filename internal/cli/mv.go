@@ -13,7 +13,7 @@ func mvCmd(a *app) *cobra.Command {
 	var force bool
 	cmd := &cobra.Command{
 		Use:   "mv SRC DST",
-		Short: "Update the database after a file or directory was moved on disk",
+		Short: "Update the database after a file or directory was moved on disk without rescanning",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(_ *cobra.Command, args []string) error {
 			src, err := db.Resolve(args[0])

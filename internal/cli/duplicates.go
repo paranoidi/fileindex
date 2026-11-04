@@ -112,7 +112,7 @@ func duplicatesCmd(a *app) *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&within, "within", false, "Only groups whose copies are all inside path")
 	cmd.Flags().StringVar(&minSizeArg, "min-size", "", "Minimum file size, e.g. 10M, 500KB")
-	cmd.Flags().BoolVarP(&fullHash, "full-hash-potential", "f", false, "Fully hash the fast-hashed files of potential duplicates first, to confirm or rule them out")
+	cmd.Flags().BoolVarP(&fullHash, "full-hash-potential", "f", false, "Fully hash the fast-hashed files of potential duplicates first, to confirm or rule them out. Useful only if scan --fast was used.")
 	return cmd
 }
 
