@@ -113,7 +113,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	root.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose output")
 	root.Args = cobra.NoArgs
 
-	root.AddCommand(initCmd(a), statsCmd(a), vacuumCmd(a), scanCmd(a), findCmd(a), lsCmd(a), matchCmd(a), duplicatesCmd(a), diffCmd(a), verifyCmd(a), treeCmd(a), mvCmd(a), pruneCmd(a), removeCmd(a), exportCmd(a), importCmd(a), tagCmd(a), tagsCmd(a), findTaggedCmd(a))
+	root.AddCommand(initCmd(a), upgradeDBCmd(a), statsCmd(a), vacuumCmd(a), scanCmd(a), findCmd(a), lsCmd(a), matchCmd(a), duplicatesCmd(a), diffCmd(a), verifyCmd(a), treeCmd(a), mvCmd(a), pruneCmd(a), removeCmd(a), exportCmd(a), importCmd(a), tagCmd(a), tagsCmd(a), findTaggedCmd(a))
 
 	err := root.Execute()
 	if a.db != nil {

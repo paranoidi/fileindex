@@ -22,7 +22,7 @@ fileindex verify                # re-check indexed files against disk
 fileindex prune                 # forget files gone from disk
 ```
 
-Other commands: `diff`, `ls`, `tree`, `mv`, `remove`, `tag`/`tags`/`find-tagged`, `export`/`import` (CSV), `stats`, `vacuum`. See `fileindex <command> --help`.
+Other commands: `diff`, `ls`, `tree`, `mv`, `remove`, `tag`/`tags`/`find-tagged`, `export`/`import` (CSV), `stats`, `vacuum`, `upgrade-db` (migrate the database after updating fileindex). See `fileindex <command> --help`.
 
 ## Scanning
 

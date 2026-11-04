@@ -5,7 +5,6 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
-	"io"
 	"path"
 	"path/filepath"
 	"testing"
@@ -27,7 +26,7 @@ func Init(t testing.TB, p string) *db.DB {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { d.Close() })
-	if err := d.Init(io.Discard); err != nil {
+	if err := d.Init(); err != nil {
 		t.Fatal(err)
 	}
 	return d

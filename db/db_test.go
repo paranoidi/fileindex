@@ -3,7 +3,6 @@ package db_test
 import (
 	"context"
 	"errors"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -112,7 +111,7 @@ func TestInitSchema(t *testing.T) {
 	if mode != "wal" {
 		t.Errorf("journal_mode = %q", mode)
 	}
-	if err := d.Init(io.Discard); err != nil {
+	if err := d.Init(); err != nil {
 		t.Errorf("second Init: %v", err)
 	}
 }
@@ -146,7 +145,7 @@ func TestRequireSchema(t *testing.T) {
 	if err := d.RequireSchema(); err != db.ErrNotInitialised {
 		t.Errorf("got %v", err)
 	}
-	if err := d.Init(io.Discard); err != nil {
+	if err := d.Init(); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.RequireSchema(); err != nil {
@@ -460,7 +459,7 @@ func TestMigrateV6(t *testing.T) {
 	}
 
 	var out strings.Builder
-	if err := d.Init(&out); err != nil {
+	if err := d.Upgrade(&out); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "Migrating database to schema v7") {
@@ -646,7 +645,7 @@ func TestMigrateV7(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out strings.Builder
-	if err := d.Init(&out); err != nil {
+	if err := d.Upgrade(&out); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "schema v9") {
@@ -743,8 +742,8 @@ func TestMigrateV8(t *testing.T) {
 		t.Errorf("RequireSchema on v8: %v", err)
 	}
 	var out strings.Builder
-	if err := d.Init(&out); err != nil || !strings.Contains(out.String(), "schema v9") {
-		t.Fatalf("Init: %v, %q", err, out.String())
+	if err := d.Upgrade(&out); err != nil || !strings.Contains(out.String(), "schema v9") {
+		t.Fatalf("Upgrade: %v, %q", err, out.String())
 	}
 	if err := d.RequireSchema(); err != nil {
 		t.Error(err)

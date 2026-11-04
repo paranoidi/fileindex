@@ -3,7 +3,6 @@ package scan_test
 import (
 	"context"
 	"errors"
-	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -48,7 +47,7 @@ func newIndex(t *testing.T) (*db.DB, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { d.Close() })
-	if err := d.Init(io.Discard); err != nil {
+	if err := d.Init(); err != nil {
 		t.Fatal(err)
 	}
 	tree, err := filepath.EvalSymlinks(t.TempDir())
@@ -322,7 +321,7 @@ func TestRunSkipsOwnDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { d.Close() })
-	if err := d.Init(io.Discard); err != nil {
+	if err := d.Init(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := d.Exec("PRAGMA journal_mode=WAL"); err != nil {

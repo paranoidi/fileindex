@@ -104,7 +104,7 @@ func TestFindOutdatedSchema(t *testing.T) {
 	if _, err := d.Exec("DELETE FROM schema_version WHERE version = 9"); err != nil {
 		t.Fatal(err)
 	}
-	if code, _, errOut := h.run("find", "*", "/m"); code != 1 || !strings.Contains(errOut, "run `fileindex init` to upgrade") {
+	if code, _, errOut := h.run("find", "*", "/m"); code != 1 || !strings.Contains(errOut, "run `fileindex upgrade-db`") {
 		t.Errorf("exit %d, %q", code, errOut)
 	}
 }

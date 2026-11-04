@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/paranoidi/fileindex/db"
 	"github.com/paranoidi/fileindex/internal/dbtest"
 )
 
@@ -88,7 +89,50 @@ func TestInitSchemaVersionMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	code, _, errOut := h.run("init")
-	if code != 1 || errOut != "Error: Database schema version mismatch: expected 9, found 10\n" {
+	if code != 1 || errOut != "Error: "+db.ErrNewerSchema.Error()+"\n" {
+		t.Fatalf("exit %d, stderr %q", code, errOut)
+	}
+}
+
+// init never migrates: an outdated DB is left for upgrade-db.
+func TestInitRefusesOutdatedThenUpgradeDB(t *testing.T) {
+	h := newHarness(t)
+	d := dbtest.Init(t, h.dbPath())
+	for _, q := range []string{"DROP INDEX idx_instance_fast", "ALTER TABLE instance DROP COLUMN sha256_8kb", "DELETE FROM schema_version", "INSERT INTO schema_version (version) VALUES (8)"} {
+		if _, err := d.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if code, _, errOut := h.run("init"); code != 1 || errOut != "Error: "+db.ErrOutdatedSchema.Error()+"\n" {
+		t.Fatalf("init: exit %d, stderr %q", code, errOut)
+	}
+	code, out, errOut := h.run("upgrade-db")
+	if code != 0 || out != "Database at schema v9: "+h.dbPath()+"\n" || !strings.Contains(errOut, "Migrating") {
+		t.Fatalf("upgrade-db: exit %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	code, _, errOut = h.run("upgrade-db") // already current
+	if code != 0 || errOut != "" {
+		t.Fatalf("second upgrade-db: exit %d, stderr %q", code, errOut)
+	}
+	h.mustRun("init")
+}
+
+func TestUpgradeDBBeforeInit(t *testing.T) {
+	h := newHarness(t)
+	if code, _, errOut := h.run("upgrade-db"); code != 1 || errOut != "Error: "+db.ErrNotInitialised.Error()+"\n" {
+		t.Fatalf("exit %d, stderr %q", code, errOut)
+	}
+}
+
+func TestUpgradeDBTooOld(t *testing.T) {
+	h := newHarness(t)
+	d := dbtest.Init(t, h.dbPath())
+	for _, q := range []string{"DELETE FROM schema_version", "INSERT INTO schema_version (version) VALUES (5)"} {
+		if _, err := d.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if code, _, errOut := h.run("upgrade-db"); code != 1 || !strings.Contains(errOut, "v5 is too old") {
 		t.Fatalf("exit %d, stderr %q", code, errOut)
 	}
 }

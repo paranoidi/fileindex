@@ -234,11 +234,10 @@ ALTER TABLE instance_new RENAME TO instance;
 	return tx.Commit()
 }
 
-// Init switches to WAL, then checks the schema version, migrates a v6, v7 or v8 DB
-// (announced on w, since rebuilding the FTS indexes takes minutes on millions
-// of instances) or creates schema v9.
-// It is the only place that changes the journal mode or creates tables.
-func (d *DB) Init(w io.Writer) error {
+// Init switches to WAL and creates schema v9 on a new DB. An existing DB must
+// already be on it: only Upgrade migrates. Init and Upgrade are the only places
+// that change the journal mode or the schema.
+func (d *DB) Init() error {
 	if _, err := d.Exec("PRAGMA journal_mode = WAL"); err != nil {
 		return err
 	}
@@ -246,37 +245,42 @@ func (d *DB) Init(w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	ddl := schema
-	if exists {
-		v, err := d.version()
-		if err != nil {
+	if !exists {
+		return d.execTx(schema)
+	}
+	return d.RequireSchema()
+}
+
+// Upgrade migrates a v6, v7 or v8 DB to schema v9, announced on w since rebuilding
+// the FTS indexes takes minutes on millions of instances. A DB already on v9 is
+// left alone.
+func (d *DB) Upgrade(w io.Writer) error {
+	if err := d.RequireSchema(); err != ErrOutdatedSchema {
+		return err
+	}
+	if _, err := d.Exec("PRAGMA journal_mode = WAL"); err != nil {
+		return err
+	}
+	v, err := d.version()
+	if err != nil {
+		return err
+	}
+	if v.Int64 == 6 {
+		fmt.Fprintln(w, "Migrating database to schema v7 (full-text search)...")
+		if err := d.execTx(migrateV6); err != nil {
 			return err
 		}
-		if v.Valid && v.Int64 == 6 {
-			fmt.Fprintln(w, "Migrating database to schema v7 (full-text search)...")
-			if err := d.execTx(migrateV6); err != nil {
-				return err
-			}
-			v.Int64 = 7
-		}
-		switch {
-		case v.Valid && v.Int64 == SchemaVersion:
-			return nil
-		case v.Valid && v.Int64 == 7:
-			fmt.Fprintln(w, "Migrating database to schema v9 (files indexed before hashing, fast hashes)...")
-			return d.migrateV7()
-		case v.Valid && v.Int64 == 8:
-			fmt.Fprintln(w, "Migrating database to schema v9 (fast hashes)...")
-			return d.execTx(migrateV8)
-		default:
-			found := "None"
-			if v.Valid {
-				found = fmt.Sprint(v.Int64)
-			}
-			return fmt.Errorf("Database schema version mismatch: expected %d, found %s", SchemaVersion, found)
-		}
+		v.Int64 = 7
 	}
-	return d.execTx(ddl)
+	switch v.Int64 {
+	case 7:
+		fmt.Fprintln(w, "Migrating database to schema v9 (files indexed before hashing, fast hashes)...")
+		return d.migrateV7()
+	case 8:
+		fmt.Fprintln(w, "Migrating database to schema v9 (fast hashes)...")
+		return d.execTx(migrateV8)
+	}
+	return fmt.Errorf("Database schema v%d is too old to upgrade, expected at least v6", v.Int64)
 }
 
 func (d *DB) execTx(ddl string) error {
@@ -305,12 +309,12 @@ func (d *DB) hasTable(name string) (bool, error) {
 
 var ErrNotInitialised = errors.New("database not initialised, run `fileindex init`")
 
-var ErrOutdatedSchema = errors.New("database schema is outdated, run `fileindex init` to upgrade it")
+var ErrOutdatedSchema = errors.New("database schema is outdated, run `fileindex upgrade-db`")
 
 var ErrNewerSchema = errors.New("database schema is newer than this fileindex supports, upgrade fileindex")
 
 // RequireSchema fails early on a DB that `init` never ran on, one still on
-// an older schema (`init` migrates it), or one on a newer schema than this
+// an older schema (`upgrade-db` migrates it), or one on a newer schema than this
 // code writes.
 func (d *DB) RequireSchema() error {
 	ok, err := d.hasTable("schema_version")
