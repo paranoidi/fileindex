@@ -15,7 +15,7 @@ func duplicatesCmd(a *app) *cobra.Command {
 	var within, fullHash bool
 	var minSizeArg string
 	cmd := &cobra.Command{
-		Use:   "duplicates [path]",
+		Use:   "duplicates [absolute-path]",
 		Short: "Find files with the same content (JPEGs compared without metadata)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
@@ -38,26 +38,22 @@ func duplicatesCmd(a *app) *cobra.Command {
 			if err := d.RequireSchema(); err != nil {
 				return err
 			}
-			fmt.Fprintln(a.stdout, "Finding duplicates...")
 
 			var filter []int64
 			if len(args) > 0 {
-				path, err := db.Resolve(args[0])
-				if err != nil {
-					return err
-				}
-				id, found, err := db.DirByPath(d, path)
+				// The path is matched as written, without touching the filesystem.
+				id, found, err := db.DirByPath(d, args[0])
 				if err != nil {
 					return err
 				}
 				if !found {
-					fmt.Fprintln(a.stdout, "No duplicate files found")
-					return nil
+					return fmt.Errorf("Path '%s' not found in database", args[0])
 				}
 				if filter, err = db.TreeIDs(d, id, true); err != nil {
 					return err
 				}
 			}
+			fmt.Fprintln(a.stdout, "Finding duplicates...")
 			potentialSets := func() ([]db.DupGroup, error) {
 				all, err := d.PotentialDuplicates(filter, within)
 				return atLeast(all, minSize), err

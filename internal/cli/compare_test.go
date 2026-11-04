@@ -41,32 +41,31 @@ func TestDuplicates(t *testing.T) {
 	if out := h.mustRun("duplicates", "/m/dir2", "--within"); out != "Finding duplicates...\nNo duplicate files found\n" {
 		t.Errorf("--within dir2: %q", out)
 	}
-	if out := h.mustRun("duplicates", "/nonexistent"); !strings.Contains(out, "No duplicate files found") {
-		t.Errorf("nonexistent: %q", out)
-	}
 	if out := h.mustRun("duplicates", "--min-size", "5"); !strings.Contains(out, "Found 1 sets") || !strings.Contains(out, "5 bytes") {
 		t.Errorf("--min-size 5: %q", out)
-	}
-
-	// a relative path resolves against the working directory
-	tree := t.TempDir()
-	os.MkdirAll(filepath.Join(tree, "rel"), 0o755)
-	dbtest.AddFile(t, d, filepath.Join(tree, "rel", "x.jpg"), "relative")
-	dbtest.AddFile(t, d, filepath.Join(tree, "rel", "y.jpg"), "relative")
-	t.Chdir(tree)
-	if out := h.mustRun("duplicates", "rel", "--within"); !strings.Contains(out, "Found 1 sets") {
-		t.Errorf("relative: %q", out)
 	}
 }
 
 func TestDuplicatesErrors(t *testing.T) {
-	h, _ := findHarness(t)
+	h, d := findHarness(t)
 	code, out, errOut := h.run("duplicates", "--min-size", "10XB")
 	if code != 1 || out != "" || errOut != "Error parsing --min-size: Unknown size unit: XB in 10XB\n" {
 		t.Errorf("--min-size: exit %d %q %q", code, out, errOut)
 	}
 	if code, _, _ := h.run("duplicates", "--within"); code != 2 {
 		t.Errorf("--within without path: exit %d", code)
+	}
+	// a path is matched as written: not in the index means an error, before any output
+	dir := t.TempDir()
+	dbtest.AddFile(t, d, filepath.Join(dir, "real", "a.jpg"), "x")
+	os.MkdirAll(filepath.Join(dir, "real"), 0o755)
+	os.Symlink(filepath.Join(dir, "real"), filepath.Join(dir, "link"))
+	t.Chdir(dir)
+	for _, p := range []string{"/nonexistent", "real", ".", filepath.Join(dir, "link")} {
+		code, out, errOut := h.run("duplicates", p)
+		if want := "Path '" + p + "' not found in database"; code != 1 || out != "" || !strings.Contains(errOut, want) {
+			t.Errorf("%s: exit %d %q %q", p, code, out, errOut)
+		}
 	}
 }
 
