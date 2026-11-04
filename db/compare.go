@@ -181,6 +181,9 @@ func (d *DB) dupGroups(query string, filter []int64, within bool) ([]DupGroup, e
 	}
 	var groups []keyed
 	paths := dirPaths{}
+	if err := paths.loadAll(d); err != nil {
+		return nil, err
+	}
 	for _, h := range order {
 		insts := byHash[h]
 		if len(insts) < 2 {

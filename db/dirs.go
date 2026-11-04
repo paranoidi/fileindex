@@ -103,20 +103,81 @@ func BuildFilePath(q Querier, dirID *int64, filename string) (string, error) {
 	return JoinParts([]string{dir, filename}), nil
 }
 
-// dirPaths memoises BuildDirPath per dir id, so listing many files in few dirs
-// doesn't re-walk the same ancestors for every row.
+// dirPaths memoises dir paths by id, ancestors included, so listing many files
+// costs one query per distinct dir, not one per ancestor per dir.
 type dirPaths map[int64]string
 
 func (m dirPaths) dir(q Querier, id int64) (string, error) {
-	p, ok := m[id]
-	if !ok {
-		var err error
-		if p, err = BuildDirPath(q, &id); err != nil {
+	if p, ok := m[id]; ok {
+		return p, nil
+	}
+	var name string
+	var parent sql.NullInt64
+	err := q.QueryRow("SELECT name, parent_id FROM dir WHERE id = ?", id).Scan(&name, &parent)
+	if err == sql.ErrNoRows {
+		return "", fmt.Errorf("Directory id %d not found in database", id)
+	}
+	if err != nil {
+		return "", err
+	}
+	p := name
+	if parent.Valid {
+		pp, err := m.dir(q, parent.Int64)
+		if err != nil {
 			return "", err
 		}
-		m[id] = p
+		p = JoinParts([]string{pp, name})
 	}
+	m[id] = p
 	return p, nil
+}
+
+// loadAll fills m with every dir's path from one query. For listings that touch
+// a large share of the dirs, where a query per dir costs far more.
+func (m dirPaths) loadAll(q Querier) error {
+	rows, err := q.Query("SELECT id, parent_id, name FROM dir")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type node struct {
+		parent sql.NullInt64
+		name   string
+	}
+	nodes := map[int64]node{}
+	for rows.Next() {
+		var id int64
+		var n node
+		if err := rows.Scan(&id, &n.parent, &n.name); err != nil {
+			return err
+		}
+		nodes[id] = n
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, n := range nodes {
+		if _, ok := nodes[n.parent.Int64]; n.parent.Valid && !ok {
+			return fmt.Errorf("Directory id %d not found in database", n.parent.Int64)
+		}
+	}
+	var build func(id int64) string
+	build = func(id int64) string {
+		if p, ok := m[id]; ok {
+			return p
+		}
+		n := nodes[id]
+		p := n.name
+		if n.parent.Valid {
+			p = JoinParts([]string{build(n.parent.Int64), n.name})
+		}
+		m[id] = p
+		return p
+	}
+	for id := range nodes {
+		build(id)
+	}
+	return nil
 }
 
 // file is BuildFilePath for a dir that exists (never the virtual root).
