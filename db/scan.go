@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -258,47 +259,108 @@ type UnhashedInstance struct {
 	Path string
 }
 
-// UnhashedUnder returns up to limit unhashed instances with id > after, by id,
-// in the dir tree at path or, when path is an indexed file, that file. Page by
-// passing the last id back; the memory held is one page. With skipFast,
-// instances that are already fast-hashed are left out.
-func (d *DB) UnhashedUnder(path string, after int64, limit int, skipFast bool) ([]UnhashedInstance, error) {
-	q, args, err := d.unhashedScope(path, skipFast)
-	if err != nil || q == "" {
-		return nil, err
+// maxCachedPaths caps UnhashedPages' path cache; ids follow walk order, so a
+// cleared cache loses little.
+const maxCachedPaths = 100_000
+
+// UnhashedPages pages through the unhashed instances of one dir tree or file.
+type UnhashedPages struct {
+	d      *DB
+	query  string // instances by id, not yet limited to the scope's dirs
+	args   []any
+	tree   map[int64]bool // the scope's dirs; nil when query is already limited
+	paths  dirPaths
+	after  int64
+	isDone bool
+}
+
+// UnhashedPages returns the pages of unhashed instances in the dir tree at path
+// or, when path is an indexed file, of that file; nil when path is not in the
+// index. With skipFast, instances that are already fast-hashed are left out.
+//
+// The tree's dir ids are loaded once and pages are filtered against them here: a
+// query limited by the recursive dir CTE repeats the whole tree walk per page,
+// which at 1.3M dirs cost seconds a page and starved the hash workers.
+// ponytail: holds every dir id of the tree, about 40 MB at 1.3M dirs; a temp table
+// on a pinned connection would avoid that if it ever matters.
+func (d *DB) UnhashedPages(path string, skipFast bool) (*UnhashedPages, error) {
+	p := &UnhashedPages{d: d, paths: dirPaths{},
+		query: "SELECT i.id, i.dir_id, i.filename FROM instance i WHERE i.file_id IS NULL"}
+	if skipFast {
+		p.query += " AND i.sha256_8kb IS NULL"
 	}
-	rows, err := d.Query(q+" AND i.id > ? ORDER BY i.id LIMIT ?",
-		append(append([]any{}, args...), after, limit)...)
+	id, found, err := DirByPath(d, path)
 	if err != nil {
 		return nil, err
 	}
-	var out []UnhashedInstance
-	var dirs []int64
-	var names []string
-	for rows.Next() {
-		var u UnhashedInstance
-		var dir int64
-		var name string
-		if err := rows.Scan(&u.ID, &dir, &name); err != nil {
-			rows.Close()
+	if found {
+		ids, err := TreeIDs(d, id, true)
+		if err != nil {
 			return nil, err
 		}
-		out, dirs, names = append(out, u), append(dirs, dir), append(names, name)
+		p.tree = make(map[int64]bool, len(ids))
+		for _, x := range ids {
+			p.tree[x] = true
+		}
+		return p, nil
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	dirID, found, err := DirByPath(d, filepath.Dir(path))
+	if err != nil || !found {
 		return nil, err
 	}
-	paths := dirPaths{}
-	for i := range out {
-		if out[i].Path, err = paths.file(d, dirs[i], names[i]); err != nil {
+	p.query += " AND i.dir_id = ? AND i.filename = ?"
+	p.args = []any{*dirID, filepath.Base(path)}
+	return p, nil
+}
+
+// Next returns the next unhashed instances, by id: at most limit, and none only
+// when there are no more. Instances hashed since the last call are not returned.
+func (p *UnhashedPages) Next(limit int) ([]UnhashedInstance, error) {
+	type row struct {
+		id   int64
+		dir  int64
+		name string
+	}
+	var found []row
+	for len(found) == 0 && !p.isDone {
+		rows, err := p.d.Query(p.query+" AND i.id > ? ORDER BY i.id LIMIT ?", append(slices.Clone(p.args), p.after, limit)...)
+		if err != nil {
 			return nil, err
 		}
+		n := 0
+		for rows.Next() {
+			var r row
+			if err := rows.Scan(&r.id, &r.dir, &r.name); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			n++
+			p.after = r.id
+			if p.tree == nil || p.tree[r.dir] {
+				found = append(found, r)
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		p.isDone = n < limit
+	}
+	if len(p.paths) > maxCachedPaths {
+		clear(p.paths)
+	}
+	out := make([]UnhashedInstance, len(found))
+	for i, r := range found {
+		path, err := p.paths.file(p.d, r.dir, r.name)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = UnhashedInstance{ID: r.id, Path: path}
 	}
 	return out, nil
 }
 
-// CountUnhashed counts the instances UnhashedUnder would page through.
+// CountUnhashed counts the instances UnhashedPages would page through.
 func (d *DB) CountUnhashed(path string, skipFast bool) (int, error) {
 	q, args, err := d.unhashedScope(path, skipFast)
 	if err != nil || q == "" {

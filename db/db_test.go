@@ -1013,3 +1013,64 @@ func TestDirListerReusesAndRefreshes(t *testing.T) {
 		t.Error("dir created after a miss not found")
 	}
 }
+
+func TestUnhashedPages(t *testing.T) {
+	d := dbtest.New(t)
+	var want []string
+	var files []db.DiscoveredFile
+	for i := range 25 {
+		dir := "/out"
+		if i%5 != 0 { // scope files are spread across pages of outsiders and two dirs
+			dir = fmt.Sprintf("/m/sub%d", i%2)
+			want = append(want, fmt.Sprintf("%s/f%d", dir, i))
+		}
+		files = append(files, db.DiscoveredFile{Dir: dir, Name: fmt.Sprintf("f%d", i), Size: 1, Mtime: time.Unix(1700000000, 0)})
+	}
+	if _, err := d.CommitDiscovered(files, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages, err := d.UnhashedPages("/m", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for {
+		page, err := pages.Next(3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		if len(page) > 3 {
+			t.Fatalf("page of %d", len(page))
+		}
+		for _, u := range page {
+			got = append(got, u.Path)
+		}
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %v\nwant %v", got, want)
+	}
+
+	// A page wholly outside the scope must not end the paging early.
+	pages, err = d.UnhashedPages("/m/sub1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page, err := pages.Next(1); err != nil || len(page) != 1 || page[0].Path != "/m/sub1/f1" {
+		t.Fatalf("first page %v, %v", page, err)
+	}
+
+	// An indexed file is its own scope; an unknown path has none.
+	pages, err = d.UnhashedPages("/out/f5", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page, err := pages.Next(10); err != nil || len(page) != 1 || page[0].Path != "/out/f5" {
+		t.Fatalf("file scope %v, %v", page, err)
+	}
+	if pages, err = d.UnhashedPages("/nowhere/x", false); err != nil || pages != nil {
+		t.Fatalf("unknown path: %v, %v", pages, err)
+	}
+}

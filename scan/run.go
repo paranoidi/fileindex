@@ -112,9 +112,10 @@ func ResolveRoots(args []string) ([]string, error) {
 // mtime it was hashed at, so hashes always match the instance. A file that
 // cannot be hashed stays unhashed and is retried by the next run.
 //
-// Memory is bounded whatever the tree size: the walk streams into one batch
+// Memory does not grow with the file count: the walk streams into one batch
 // (plus one dir's records for the skip check) and hashing pages through
 // unhashed instances by id, one page at a time; nothing collects the file list.
+// Hashing does hold each root's dir ids (see db.UnhashedPages).
 //
 // Cancelling ctx stops it between files or pruned dirs; Run then returns with
 // Interrupted set once the commit in flight has finished. It holds no package
@@ -363,8 +364,16 @@ func hashPending(ctx context.Context, d *db.DB, opt Options, maxFiles int, scope
 	var pageErr error
 	paths := func(yield func(string) bool) {
 		for _, sc := range scopes {
-			for after := int64(0); ; {
-				page, err := d.UnhashedUnder(sc, after, hashPage, opt.Fast)
+			pages, err := d.UnhashedPages(sc, opt.Fast)
+			if err != nil {
+				pageErr = err
+				return
+			}
+			if pages == nil {
+				continue // not in the index
+			}
+			for {
+				page, err := pages.Next(hashPage)
 				if err != nil {
 					pageErr = err
 					return
@@ -373,7 +382,6 @@ func hashPending(ctx context.Context, d *db.DB, opt Options, maxFiles int, scope
 					break
 				}
 				for _, u := range page {
-					after = u.ID
 					if ctx.Err() != nil || !yield(u.Path) {
 						return
 					}
