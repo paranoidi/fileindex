@@ -52,6 +52,9 @@ FROM instance i LEFT JOIN file f ON i.file_id = f.id `
 		return nil, err
 	}
 	paths := dirPaths{}
+	if err := paths.preload(d, dirs); err != nil {
+		return nil, err
+	}
 	for i := range out {
 		if out[i].Path, err = paths.file(d, dirs[i], out[i].Path); err != nil {
 			return nil, err

@@ -43,10 +43,11 @@ func exportCmd(a *app) *cobra.Command {
 			w := csv.NewWriter(f)
 			w.UseCRLF = true
 			w.Write(db.ExportHeader)
-			md5s := map[string]bool{}
-			n := 0
-			if err := d.ExportRows(func(rec []string) error {
-				md5s[rec[0]] = true
+			files, n, lastMD5 := 0, 0, ""
+			if err := d.ExportRows(func(rec []string) error { // sorted by md5, which is never empty
+				if rec[0] != lastMD5 {
+					files, lastMD5 = files+1, rec[0]
+				}
 				n++
 				return w.Write(rec)
 			}); err != nil {
@@ -60,7 +61,7 @@ func exportCmd(a *app) *cobra.Command {
 				return err
 			}
 			fmt.Fprintf(a.stdout, "Export completed in %.2f seconds\nFiles exported: %d\nInstances exported: %d\nCSV file: %s\n",
-				time.Since(start).Seconds(), len(md5s), n, path)
+				time.Since(start).Seconds(), files, n, path)
 			return nil
 		},
 	}

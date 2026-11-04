@@ -1100,3 +1100,41 @@ INSERT INTO dir (parent_id, name, name_lower) SELECT ?, 'd' || i, 'd' || i FROM 
 		t.Errorf("/keep = %v, %v", files, err)
 	}
 }
+
+// Listings build the same paths lazily and from the whole dir table.
+func TestListingsPreloadedPaths(t *testing.T) {
+	d := dbtest.New(t)
+	dbtest.AddFile(t, d, "/m/a/report.txt", "1")
+	dbtest.AddFile(t, d, "/m/b/c/report.txt", "2")
+	root, _, err := db.DirByPath(d, "/m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := func() []string {
+		t.Helper()
+		var out []string
+		found, err := d.FindByName("*report*", *root, true, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range found {
+			out = append(out, f.Path)
+		}
+		entries, err := d.FilesUnder(*root, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			out = append(out, e.Path)
+		}
+		return out
+	}
+	lazy := list()
+	if want := []string{"/m/a/report.txt", "/m/b/c/report.txt", "/m/a/report.txt", "/m/b/c/report.txt"}; !slices.Equal(lazy, want) {
+		t.Fatalf("lazy = %v", lazy)
+	}
+	defer db.SetPreloadDirs(1)()
+	if got := list(); !slices.Equal(got, lazy) {
+		t.Errorf("preloaded = %v, lazy = %v", got, lazy)
+	}
+}

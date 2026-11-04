@@ -141,8 +141,12 @@ ORDER BY d.name`, root, like, root)
 			ids = append(ids, id)
 		}
 		rows.Close()
+		paths := dirPaths{}
+		if err := paths.preload(d, ids); err != nil {
+			return nil, err
+		}
 		for i, id := range ids {
-			if out[start+i].Path, err = BuildDirPath(d, &id); err != nil {
+			if out[start+i].Path, err = paths.dir(d, id); err != nil {
 				return nil, err
 			}
 		}
@@ -183,6 +187,9 @@ ORDER BY i.filename, i.id`, append([]any{root}, args...)...)
 		return nil, err
 	}
 	paths := dirPaths{}
+	if err := paths.preload(d, dirIDs); err != nil {
+		return nil, err
+	}
 	for i := range out {
 		if out[i].Path, err = paths.file(d, dirIDs[i], out[i].Name); err != nil {
 			return nil, err

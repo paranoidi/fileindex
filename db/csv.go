@@ -22,6 +22,9 @@ ORDER BY f.md5, i.dir_id, i.filename`)
 	}
 	defer rows.Close()
 	paths := dirPaths{}
+	if err := paths.loadAll(d); err != nil { // an export touches nearly every dir
+		return err
+	}
 	for rows.Next() {
 		var v [12]sql.NullString
 		var dir int64

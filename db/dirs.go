@@ -178,6 +178,22 @@ func (m dirPaths) loadAll(q Querier) error {
 	return nil
 }
 
+// preloadDirs is how many distinct dirs make preload read the whole dir table:
+// one query per dir costs more from about here. Tests lower it.
+var preloadDirs = 10000
+
+// preload fills m with loadAll when dirs (a listing's dir id per row) spans many
+// dirs; otherwise lookups stay lazy, so a small listing doesn't pay for a large table.
+func (m dirPaths) preload(q Querier, dirs []int64) error {
+	seen := map[int64]bool{}
+	for _, id := range dirs {
+		if seen[id] = true; len(seen) >= preloadDirs {
+			return m.loadAll(q)
+		}
+	}
+	return nil
+}
+
 // file is BuildFilePath for a dir that exists (never the virtual root).
 func (m dirPaths) file(q Querier, dir int64, name string) (string, error) {
 	p, err := m.dir(q, dir)

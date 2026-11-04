@@ -138,7 +138,7 @@ func (d *DB) RemoveTags(t TagTarget, names []string) ([]Removed, error) {
 		for _, id := range pass.ids {
 			var path string
 			if pass.isDir {
-				path, err = BuildDirPath(tx, &id)
+				path, err = paths.dir(tx, id)
 			} else {
 				var dir int64
 				var name string
@@ -266,8 +266,11 @@ func (d *DB) FindByTags(dir int64, names []string, recursive bool) ([]string, er
 		return nil, err
 	}
 	var dirs []string
+	if err := paths.preload(d, dirIDs); err != nil {
+		return nil, err
+	}
 	for _, id := range dirIDs {
-		p, err := BuildDirPath(d, &id)
+		p, err := paths.dir(d, id)
 		if err != nil {
 			return nil, err
 		}
