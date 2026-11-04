@@ -58,7 +58,9 @@ func TestInitCreatesConfigAndDB(t *testing.T) {
 	if out != want {
 		t.Fatalf("got %q want %q", out, want)
 	}
-	h.mustRun("init") // idempotent
+	if code, _, errOut := h.run("init"); code != 1 || errOut != "Error: already initialised: "+h.dbPath()+"\n" {
+		t.Fatalf("second init: exit %d, stderr %q", code, errOut)
+	}
 }
 
 func TestNoCommandPrintsHelpExit1(t *testing.T) {
@@ -114,7 +116,6 @@ func TestInitRefusesOutdatedThenUpgradeDB(t *testing.T) {
 	if code != 0 || errOut != "" {
 		t.Fatalf("second upgrade-db: exit %d, stderr %q", code, errOut)
 	}
-	h.mustRun("init")
 }
 
 func TestUpgradeDBBeforeInit(t *testing.T) {

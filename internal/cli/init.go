@@ -18,7 +18,7 @@ func initCmd(a *app) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "init",
 		Short: "Initialize database and configuration, optionally register shell autocomplete",
-		Long: `Initialize database and configuration.
+		Long: `Initialize database and configuration. Fails if the database is already initialised.
 
 When run in a terminal, also offers to register shell autocomplete (bash, zsh or fish).
 --autocomplete registers it without asking and skips database initialization.
@@ -29,6 +29,13 @@ When run in a terminal, also offers to register shell autocomplete (bash, zsh or
 				d, err := a.openDB()
 				if err != nil {
 					return err
+				}
+				switch err := d.RequireSchema(); err {
+				case nil:
+					return fmt.Errorf("already initialised: %s", d.Path)
+				case db.ErrNotInitialised:
+				default:
+					return err // outdated/newer schema: init never migrates
 				}
 				if err := d.Init(); err != nil {
 					return err
