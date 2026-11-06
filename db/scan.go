@@ -783,9 +783,14 @@ func (d *DB) PrunePath(ctx context.Context, path string, onDir func(dir string, 
 // RemovedTree counts what RemoveTree deleted.
 type RemovedTree struct{ Instances, Files, Dirs int64 }
 
-// RemoveTree deletes the indexed dir at path with everything under it, the
-// file rows left orphaned, and the ancestors left empty (path scaffolding, as
-// GetOrCreatePath made it). The disk is not looked at.
+// RemoveTree deletes, in one transaction, the indexed dir at path with everything
+// under it, the file rows only its instances used, and the ancestors left empty
+// (path scaffolding, as GetOrCreatePath made it). Its cost follows the tree, not
+// the index: paras-commander calls it per removed dir. Orphans from earlier work
+// stay for the next sweep, and Files does not count them. The disk is not looked at.
+// ponytail: holds the tree's file ids and their JSON, about 16 bytes per hashed
+// instance; a temp table on the transaction's connection would avoid that if it
+// ever matters.
 func (d *DB) RemoveTree(path string) (RemovedTree, error) {
 	var r RemovedTree
 	id, found, err := DirByPath(d, path)
@@ -802,6 +807,12 @@ func (d *DB) RemoveTree(path string) (RemovedTree, error) {
 	defer tx.Rollback()
 	var parent sql.NullInt64
 	if err := tx.QueryRow("SELECT parent_id FROM dir WHERE id = ?", *id).Scan(&parent); err != nil {
+		return r, err
+	}
+	// CROSS JOIN keeps the walk down the tree: the query must not scan idx_instance_file_id.
+	fileIDs, err := queryIDs(tx, treeCTE+`SELECT i.file_id FROM dir_tree t
+CROSS JOIN instance i ON i.dir_id = t.id WHERE i.file_id IS NOT NULL`, *id)
+	if err != nil {
 		return r, err
 	}
 	if r.Instances, r.Dirs, err = deleteTree(tx, *id); err != nil {
@@ -821,11 +832,28 @@ func (d *DB) RemoveTree(path string) (RemovedTree, error) {
 		}
 		r.Dirs++
 	}
-	if err := tx.Commit(); err != nil {
+	if r.Files, err = deleteOrphansOf(tx, fileIDs); err != nil {
 		return r, err
 	}
-	r.Files, err = d.DeleteOrphanedFiles()
-	return r, err
+	return r, tx.Commit()
+}
+
+// deleteOrphansOf deletes the given file rows that no instance references. The
+// ids go in as one JSON value, so any number fits; repeats are harmless.
+func deleteOrphansOf(q Querier, ids []int64) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	list, err := json.Marshal(ids)
+	if err != nil {
+		return 0, err
+	}
+	res, err := q.Exec(`DELETE FROM file WHERE id IN (SELECT value FROM json_each(?))
+AND NOT EXISTS (SELECT 1 FROM instance WHERE file_id = file.id)`, string(list))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // RemoveInstance deletes the instance at the absolute file path and its file

@@ -1075,9 +1075,9 @@ func TestUnhashedPages(t *testing.T) {
 	}
 }
 
-// A tree with more dirs than SQLite takes bound variables (32766) must still go.
+// A tree with more dirs or files than SQLite takes bound variables (32766) must still go.
 func TestRemoveHugeTree(t *testing.T) {
-	const dirs = 40000
+	const dirs, files = 40000, 40000
 	d := dbtest.New(t)
 	dbtest.AddFile(t, d, "/keep/k", "k")
 	dbtest.AddFile(t, d, "/big/a/f", "f")
@@ -1089,15 +1089,67 @@ func TestRemoveHugeTree(t *testing.T) {
 INSERT INTO dir (parent_id, name, name_lower) SELECT ?, 'd' || i, 'd' || i FROM s`, dirs, *id); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := d.Exec(`WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < ?)
+INSERT INTO file (md5, sha256, filesize) SELECT 'big' || i, 'big' || i, 1 FROM s`, files); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(`INSERT INTO instance (file_id, dir_id, filename, filename_lower, size)
+SELECT id, ?, md5, md5, 1 FROM file WHERE md5 LIKE 'big%'`, *id); err != nil {
+		t.Fatal(err)
+	}
 	r, err := d.RemoveTree("/big/a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Instances != 1 || r.Files != 1 || r.Dirs != dirs+2 { // the subdirs, /big/a, and /big left empty
+	if r.Instances != files+1 || r.Files != files+1 || r.Dirs != dirs+2 { // the subdirs, /big/a, and /big left empty
 		t.Errorf("RemoveTree = %+v", r)
 	}
 	if files, err := d.DirFiles("/keep"); err != nil || len(files) != 1 {
 		t.Errorf("/keep = %v, %v", files, err)
+	}
+}
+
+// RemoveTree deletes the file rows only this tree used, and no others.
+func TestRemoveTreeOrphans(t *testing.T) {
+	d := dbtest.New(t)
+	dbtest.AddFile(t, d, "/m/tree/only", "only")
+	dbtest.AddFile(t, d, "/m/tree/twice", "twice")
+	dbtest.AddFile(t, d, "/m/tree/sub/twice", "twice")
+	dbtest.AddFile(t, d, "/m/tree/shared", "shared")
+	dbtest.AddFile(t, d, "/m/keep/shared", "shared")
+	if _, err := d.CommitDiscovered([]db.DiscoveredFile{{Dir: "/m/tree", Name: "unhashed", Size: 1, Mtime: time.Unix(1700000000, 0)}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	unrelated := dbtest.AddFile(t, d, "/m/keep/orphan", "orphan")
+	if _, err := d.Exec("DELETE FROM instance WHERE id = ?", unrelated); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := d.RemoveTree("/m/tree")
+	if err != nil || r != (db.RemovedTree{Instances: 5, Files: 2, Dirs: 2}) {
+		t.Fatalf("RemoveTree = %+v, %v", r, err)
+	}
+	if files, err := d.DirFiles("/m/keep"); err != nil || !files["shared"].Hashed {
+		t.Errorf("/m/keep lost its hash: %v, %v", files, err)
+	}
+	// the earlier orphan is still there, for the next scan's sweep
+	if n, err := d.DeleteOrphanedFiles(); err != nil || n != 1 {
+		t.Errorf("DeleteOrphanedFiles = %d, %v", n, err)
+	}
+}
+
+func TestRemoveTreeNoInstances(t *testing.T) {
+	d := dbtest.New(t)
+	dbtest.AddFile(t, d, "/m/x", "x")
+	if err := d.RecordDirs([]string{"/m/a/b"}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := d.RemoveTree("/m/a/b")
+	if err != nil || r != (db.RemovedTree{Dirs: 2}) { // b, and a left empty
+		t.Fatalf("RemoveTree = %+v, %v", r, err)
+	}
+	if _, found, _ := db.DirByPath(d, "/m"); !found {
+		t.Error("/m still holds a file but was removed")
 	}
 }
 

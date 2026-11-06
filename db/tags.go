@@ -42,8 +42,10 @@ func tagIDs(q Querier, names []string) ([]int64, []string, error) {
 	return ids, found, nil
 }
 
-func (d *DB) ids(q string, args ...any) ([]int64, error) {
-	rows, err := d.Query(q, args...)
+func (d *DB) ids(q string, args ...any) ([]int64, error) { return queryIDs(d, q, args...) }
+
+func queryIDs(q Querier, query string, args ...any) ([]int64, error) {
+	rows, err := q.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
