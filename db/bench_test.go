@@ -121,24 +121,67 @@ INSERT INTO instance (dir_id, filename, filename_lower, size) SELECT 2 + i * 19,
 	}
 }
 
-// BenchmarkDeleteOrphans sweeps 500k file rows with none to delete: what every
-// scan that changes something pays.
-func BenchmarkDeleteOrphans(b *testing.B) {
-	const files = 500000
-	d := dbtest.New(b)
+// seedFiles inserts n file rows, each with one instance in /d2.
+func seedFiles(b *testing.B, d *db.DB, n int) {
+	b.Helper()
 	seedDirs(b, d, 2)
 	if _, err := d.Exec(`WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < ?)
-INSERT INTO file (id, md5, sha256, filesize) SELECT i, 'm' || i, 's' || i, 1 FROM s`, files); err != nil {
+INSERT INTO file (id, md5, sha256, filesize) SELECT i, 'm' || i, 's' || i, 1 FROM s`, n); err != nil {
 		b.Fatal(err)
 	}
 	if _, err := d.Exec(`INSERT INTO instance (file_id, dir_id, filename, filename_lower, size)
 SELECT id, 2, 'f' || id, 'f' || id, 1 FROM file`); err != nil {
 		b.Fatal(err)
 	}
+}
+
+// BenchmarkDeleteOrphans sweeps 500k file rows with none to delete: what every
+// scan that changes something pays.
+func BenchmarkDeleteOrphans(b *testing.B) {
+	d := dbtest.New(b)
+	seedFiles(b, d, 500000)
 	for b.Loop() {
 		if n, err := d.DeleteOrphanedFiles(); err != nil || n != 0 {
 			b.Fatal(n, err)
 		}
+	}
+}
+
+// BenchmarkRemoveTree removes a dir holding 0, 100 and 100k hashed files from an
+// index of 500k others. Its cost should follow the dir, not the index.
+func BenchmarkRemoveTree(b *testing.B) {
+	const gone = "/d2/gone"
+	for _, bc := range []struct {
+		name  string
+		files int
+	}{{"empty", 0}, {"small", 100}, {"large", 100000}} {
+		b.Run(bc.name, func(b *testing.B) {
+			d := dbtest.New(b)
+			seedFiles(b, d, 500000)
+			for b.Loop() {
+				b.StopTimer()
+				if err := d.RecordDirs([]string{gone}); err != nil {
+					b.Fatal(err)
+				}
+				id, _, err := db.DirByPath(d, gone)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if _, err := d.Exec(`WITH RECURSIVE s(i) AS (SELECT 1000001 UNION ALL SELECT i + 1 FROM s WHERE i < 1000000 + ?1)
+INSERT INTO file (id, md5, sha256, filesize) SELECT i, 'm' || i, 's' || i, 1 FROM s WHERE i <= 1000000 + ?1`, bc.files); err != nil {
+					b.Fatal(err)
+				}
+				if _, err := d.Exec(`INSERT INTO instance (file_id, dir_id, filename, filename_lower, size)
+SELECT id, ?, 'f' || id, 'f' || id, 1 FROM file WHERE id > 1000000`, *id); err != nil {
+					b.Fatal(err)
+				}
+				b.StartTimer()
+				r, err := d.RemoveTree(gone)
+				if err != nil || r.Instances != int64(bc.files) || r.Files != int64(bc.files) {
+					b.Fatal(r, err)
+				}
+			}
+		})
 	}
 }
 
