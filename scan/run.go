@@ -68,6 +68,26 @@ type PhaseReporter interface {
 	Pruned(res Stats, toHash int)
 }
 
+// Stage is one of Run's stages that commits results.
+type Stage int
+
+const (
+	StageWalk Stage = iota
+	StagePrune
+	StageHash
+)
+
+// CommitReporter is an optional extension of Reporter. Committed is called after
+// each commit of walk, prune or hash results with the distinct dirs whose results
+// changed, so a caller can refresh only what shows them: the dirs of files walked
+// or hashed, and the dir holding each pruned file or dir. A dir the walk merely
+// entered is not one, so a rescan changing nothing reports nothing. It runs on the
+// path that commits, on one goroutine at a time, and must return quickly; dirs is
+// the callee's to keep. Without this interface Run collects nothing.
+type CommitReporter interface {
+	Committed(stage Stage, dirs []string)
+}
+
 // Stats is what Run did. Errors are per-file problems that didn't stop it.
 // Added and Updated count instances written by discovery, Processed and
 // TotalSize the files hashed.
@@ -195,7 +215,11 @@ func pruneRoots(ctx context.Context, d *db.DB, roots []string, r Reporter, res *
 		if !found {
 			continue // a scanned file, not a dir
 		}
-		f, n, err := d.PruneDir(ctx, root, *id, r.Prune, r.Log)
+		var onCommit func([]string)
+		if cr, ok := r.(CommitReporter); ok {
+			onCommit = func(dirs []string) { cr.Committed(StagePrune, dirs) }
+		}
+		f, n, err := d.PruneDir(ctx, root, *id, r.Prune, r.Log, onCommit)
 		res.PrunedFiles += f
 		res.PrunedDirs += n
 		if ctx.Err() != nil {
@@ -233,6 +257,7 @@ func (s Stats) mayOrphan() bool {
 func discover(ctx context.Context, d *db.DB, opt Options, maxFiles int, roots []string, r Reporter, res *Stats) ([]string, error) {
 	rr, _ := r.(RootReporter)
 	pr, _ := r.(PhaseReporter)
+	cr, _ := r.(CommitReporter)
 	isOwn := ownFiles(d.Path)
 	scopes := slices.Clone(roots)
 	var batch []db.DiscoveredFile
@@ -253,6 +278,9 @@ func discover(ctx context.Context, d *db.DB, opt Options, maxFiles int, roots []
 		res.Updated += br.Updated
 		committed += len(batch)
 		res.Discovered = committed
+		if cr != nil && len(batch) > 0 {
+			cr.Committed(StageWalk, distinctDirs(batch, func(f db.DiscoveredFile) string { return f.Dir }))
+		}
 		batch, dirs = batch[:0], dirs[:0]
 		if pr != nil {
 			pr.Indexed(committed)
@@ -407,7 +435,13 @@ func hashPending(ctx context.Context, d *db.DB, opt Options, maxFiles int, scope
 	if fr, ok := r.(FileReporter); ok {
 		onDone = fr.FileDone
 	}
-	if err := hashPaths(ctx, d, opt, maxFiles, paths, r.Worker, r.Speed, onDone, res); err != nil {
+	var onCommit func([]db.ScannedFile)
+	if cr, ok := r.(CommitReporter); ok {
+		onCommit = func(b []db.ScannedFile) {
+			cr.Committed(StageHash, distinctDirs(b, func(f db.ScannedFile) string { return f.Dir }))
+		}
+	}
+	if err := hashPaths(ctx, d, opt, maxFiles, paths, r.Worker, r.Speed, onDone, onCommit, res); err != nil {
 		return err
 	}
 	return pageErr
@@ -417,14 +451,27 @@ func hashPending(ctx context.Context, d *db.DB, opt Options, maxFiles int, scope
 // problems and a cancel land in the returned Stats, as in Run.
 func HashPaths(ctx context.Context, d *db.DB, paths []string, workers int, onStart func(int, string), onTick func(int, float64), onDone func()) (Stats, error) {
 	var res Stats
-	err := hashPaths(ctx, d, Options{Workers: workers}, batchFiles, slices.Values(paths), onStart, onTick, onDone, &res)
+	err := hashPaths(ctx, d, Options{Workers: workers}, batchFiles, slices.Values(paths), onStart, onTick, onDone, nil, &res)
 	return res, err
+}
+
+// distinctDirs returns the dirs of a batch, each once, in order of first appearance.
+func distinctDirs[T any](batch []T, dirOf func(T) string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, f := range batch {
+		if dir := dirOf(f); !seen[dir] {
+			seen[dir] = true
+			out = append(out, dir)
+		}
+	}
+	return out
 }
 
 // hashPaths hashes paths and commits batches in the background while the next
 // one is hashed; otherwise every commit stalls all workers, which shows with
-// many small files.
-func hashPaths(ctx context.Context, d *db.DB, opt Options, maxFiles int, paths iter.Seq[string], onStart func(int, string), onTick func(int, float64), onDone func(), res *Stats) error {
+// many small files. onCommit, when set, gets each batch committed without error.
+func hashPaths(ctx context.Context, d *db.DB, opt Options, maxFiles int, paths iter.Seq[string], onStart func(int, string), onTick func(int, float64), onDone func(), onCommit func([]db.ScannedFile), res *Stats) error {
 	type committed struct {
 		batch []db.ScannedFile
 		res   db.BatchResult
@@ -458,6 +505,9 @@ func hashPaths(ctx context.Context, d *db.DB, opt Options, maxFiles int, paths i
 		b, ch := batch, make(chan committed, 1)
 		go func() {
 			res, err := d.CommitScanBatch(b)
+			if err == nil && onCommit != nil {
+				onCommit(b)
+			}
 			ch <- committed{b, res, err}
 		}()
 		inflight, batch, batchSize = ch, nil, 0

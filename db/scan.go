@@ -618,7 +618,9 @@ func missing(p string) (gone bool, isDir bool, err error) {
 // and a killed process loses at most one batch, which a rerun redoes.
 // ctx is checked between dirs; on cancel the work so far is committed and
 // ctx.Err() returned with the counts. Orphaned file rows are left to the caller.
-func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir string, checked int), log func(msg string)) (files, dirs int64, err error) {
+// onCommit (may be nil) is called after each commit that removed something, with
+// the dirs that held what was removed.
+func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir string, checked int), log func(msg string), onCommit func(dirs []string)) (files, dirs int64, err error) {
 	tx, err := d.Begin()
 	if err != nil {
 		return 0, 0, err
@@ -630,11 +632,22 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 	if err := q.QueryRow("SELECT EXISTS (SELECT 1 FROM pending_tag)").Scan(&hasPending); err != nil {
 		return 0, 0, err
 	}
+	var touched []string // dirs changed since the last commit
+	commit := func() error {
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		if onCommit != nil && len(touched) > 0 {
+			onCommit(touched)
+		}
+		touched = nil
+		return nil
+	}
 	flush := func() error {
 		if pending < pruneBatch {
 			return nil
 		}
-		if err := tx.Commit(); err != nil {
+		if err := commit(); err != nil {
 			return err
 		}
 		next, err := d.Begin()
@@ -654,7 +667,7 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 	checked := 0
 	for len(stack) > 0 {
 		if ctx.Err() != nil {
-			if err := tx.Commit(); err != nil {
+			if err := commit(); err != nil {
 				return files, dirs, err
 			}
 			return files, dirs, ctx.Err()
@@ -710,6 +723,7 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 			}
 			n, _ := r.RowsAffected()
 			files, pending = files+n, pending+n
+			touched = append(touched, cur.path)
 			for _, name := range goneNames {
 				log("Pruning removed file: " + filepath.Join(cur.path, name))
 			}
@@ -720,6 +734,7 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 			return files, dirs, err
 		}
 		var subs []entry
+		var removedDir bool
 		for rows.Next() {
 			var e entry
 			if err := rows.Scan(&e.id, &e.path); err != nil {
@@ -754,13 +769,17 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 				return files, dirs, err
 			}
 			files, dirs, pending = files+f, dirs+n, pending+f+n
+			removedDir = true
 			log("Pruning removed directory: " + s.path)
+		}
+		if removedDir && !slices.Contains(touched, cur.path) {
+			touched = append(touched, cur.path)
 		}
 		if err := flush(); err != nil {
 			return files, dirs, err
 		}
 	}
-	return files, dirs, tx.Commit()
+	return files, dirs, commit()
 }
 
 // logLostPendingFiles logs the pending tags of the named instances of a dir about
@@ -868,7 +887,7 @@ func (d *DB) PrunePath(ctx context.Context, path string, onDir func(dir string, 
 		return Pruned{}, fmt.Errorf("Path '%s' not found in database", path)
 	}
 	var p Pruned
-	p.Files, p.Dirs, err = d.PruneDir(ctx, path, *id, onDir, log) // keeps path itself
+	p.Files, p.Dirs, err = d.PruneDir(ctx, path, *id, onDir, log, nil) // keeps path itself
 	if err != nil && ctx.Err() == nil {
 		return p, err
 	}

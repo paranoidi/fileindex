@@ -72,7 +72,7 @@ func BenchmarkPruneDir(b *testing.B) {
 			b.Fatal(err)
 		}
 		b.StartTimer()
-		n, _, err := d.PruneDir(context.Background(), root, *id, nil, func(string) {})
+		n, _, err := d.PruneDir(context.Background(), root, *id, nil, func(string) {}, nil)
 		if err != nil || n != total {
 			b.Fatal(n, err)
 		}

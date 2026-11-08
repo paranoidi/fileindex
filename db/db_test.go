@@ -314,7 +314,7 @@ func TestPruneDirBatches(t *testing.T) {
 		}
 		var out strings.Builder
 		var r result
-		if r.files, r.dirs, err = d.PruneDir(context.Background(), root, *id, nil, logTo(&out)); err != nil {
+		if r.files, r.dirs, err = d.PruneDir(context.Background(), root, *id, nil, logTo(&out), nil); err != nil {
 			t.Fatal(err)
 		}
 		r.out = strings.ReplaceAll(out.String(), root, "ROOT")
@@ -368,7 +368,7 @@ func TestPruneDirListing(t *testing.T) {
 	id, _, err := db.DirByPath(d, root)
 	must(err)
 	var out strings.Builder
-	files, dirs, err := d.PruneDir(context.Background(), root, *id, nil, logTo(&out))
+	files, dirs, err := d.PruneDir(context.Background(), root, *id, nil, logTo(&out), nil)
 	must(err)
 	if files != 3 || dirs != 1 || !strings.Contains(out.String(), "nowfile") ||
 		!strings.Contains(out.String(), "gone 1.jpg") || !strings.Contains(out.String(), "gone 2.jpg") {
@@ -382,7 +382,7 @@ func TestPruneDirListing(t *testing.T) {
 	locked := filepath.Dir(add("locked/c.jpg"))
 	must(os.Chmod(locked, 0))
 	defer os.Chmod(locked, 0o755)
-	if _, _, err := d.PruneDir(context.Background(), root, *id, nil, logTo(&out)); err == nil {
+	if _, _, err := d.PruneDir(context.Background(), root, *id, nil, logTo(&out), nil); err == nil {
 		t.Error("unreadable dir: want error, as with per-file stat")
 	}
 }
