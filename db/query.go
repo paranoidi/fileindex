@@ -215,10 +215,10 @@ type ListedDir struct {
 }
 
 // ListDir returns a dir's files and subdirs, each sorted by name, with their
-// tags, in four queries whatever the dir holds.
+// tags, in five queries whatever the dir holds.
 // ponytail: dirs carry no size or mtime; tree totals cost a subtree walk each.
 func (d *DB) ListDir(id int64) (files []ListedFile, subdirs []ListedDir, err error) {
-	tags, err := d.tagsByName(fileTags, id)
+	tags, err := d.fileTagsByName(id)
 	if err != nil {
 		return nil, nil, err
 	}

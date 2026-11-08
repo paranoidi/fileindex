@@ -26,6 +26,8 @@ fileindex prune                 # forget files gone from disk
 
 Other commands: `diff`, `ls`, `tree`, `mv`, `remove`, `tag`/`tags`/`find-tagged`, `export`/`import` (CSV), `stats`, `vacuum`, `upgrade-db` (migrate the database after updating fileindex). See `fileindex <command> --help`.
 
+A file's tags belong to its content: every copy has them, and moving, renaming or editing a file keeps them. Tagging or untagging one copy applies to all of them. Empty files can't be tagged. A directory's tags stay on that directory record, and are lost if it moves on disk. A tag stays when its content leaves the index, so it can come back with the content.
+
 ## Scanning
 
 `scan` works in two phases. First it walks the paths and records every new or changed file (name, size, mtime) right away, in batches, so `find`, `ls` and `tree` see it before any hashing happens. Next it prunes records of files and dirs that are gone from disk, so stale names disappear before any hashing starts. Last it hashes the files that are not hashed yet; duplicates, `match`, `diff` and `verify` only use hashed files. An interrupted scan resumes hashing on the next run without the files having to change, and a file whose size or mtime changed is unhashed again until it is rehashed. `scan --no-hash` stops after the walk and pruning, leaving the files unhashed until a later scan. `export` skips unhashed files.

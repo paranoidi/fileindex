@@ -2,6 +2,8 @@ package db_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -105,7 +107,7 @@ func TestInitSchema(t *testing.T) {
 	d := dbtest.New(t)
 	var n int
 	d.QueryRow("SELECT COUNT(*) FROM sqlite_master").Scan(&n)
-	if n != 33 { // 7 tables + 8 indexes + 6 autoindexes + 2 FTS tables, their 7 shadow tables, 3 triggers
+	if n != 33 { // 8 tables + 7 indexes + 6 autoindexes + 2 FTS tables, their 7 shadow tables, 3 triggers
 		t.Errorf("sqlite_master rows = %d, want 33", n)
 	}
 	var mode string
@@ -449,6 +451,7 @@ func TestMigrateV6(t *testing.T) {
 	// turn it back into a v6 DB: no FTS objects, version 6
 	for _, q := range []string{
 		"DROP TRIGGER instance_fts_ai", "DROP TRIGGER instance_fts_ad", "DROP TRIGGER instance_fts_au",
+		dbtest.FileTagsV10,
 		"DROP TABLE instance_trigram", "DROP TABLE instance_words",
 		"DELETE FROM schema_version", "INSERT INTO schema_version (version) VALUES (6)",
 	} {
@@ -661,8 +664,8 @@ func TestMigrateV7(t *testing.T) {
 		t.Errorf("instances = %q, %v", sizes, err)
 	}
 	var tagged int
-	if err := d.QueryRow("SELECT COUNT(*) FROM file_tag WHERE instance_id = 9").Scan(&tagged); err != nil || tagged != 1 {
-		t.Errorf("file_tag rows = %d, %v", tagged, err)
+	if err := d.QueryRow("SELECT COUNT(*) FROM content_tag WHERE sha256 = 's2'").Scan(&tagged); err != nil || tagged != 1 {
+		t.Errorf("content_tag rows = %d, %v", tagged, err)
 	}
 	ftsIntegrity(t, d, "migration")
 	root, _, _ := db.DirByPath(d, "/orchard")
@@ -735,7 +738,7 @@ func addFast(t *testing.T, d *db.DB, dir, name string, size int64, head string) 
 
 func TestMigrateV8(t *testing.T) {
 	d := dbtest.New(t)
-	for _, q := range []string{"DROP INDEX idx_instance_fast", "ALTER TABLE instance DROP COLUMN sha256_8kb", "DELETE FROM schema_version", "INSERT INTO schema_version (version) VALUES (8)"} {
+	for _, q := range []string{dbtest.FileTagsV10, "DROP INDEX idx_instance_fast", "ALTER TABLE instance DROP COLUMN sha256_8kb", "DELETE FROM schema_version", "INSERT INTO schema_version (version) VALUES (8)"} {
 		if _, err := d.Exec(q); err != nil {
 			t.Fatal(err)
 		}
@@ -1215,6 +1218,7 @@ func TestUpgradeV9DropsRedundantIndexes(t *testing.T) {
 	fresh := indexNames(t, d)
 	dbtest.AddFile(t, d, "/m/a.txt", "a")
 	for _, q := range []string{
+		dbtest.FileTagsV10,
 		"CREATE INDEX idx_instance_dir_id ON instance(dir_id)",
 		"CREATE INDEX idx_instance_filename ON instance(filename)",
 		"CREATE INDEX idx_instance_filename_lower ON instance(filename_lower)",
@@ -1247,5 +1251,126 @@ func TestUpgradeV9DropsRedundantIndexes(t *testing.T) {
 	}
 	if files, err := d.DirFiles("/m"); err != nil || len(files) != 1 {
 		t.Errorf("DirFiles = %v, %v", files, err)
+	}
+}
+
+// A v10 DB's file tags move to content; what has no content yet stays pending, and a
+// tag on an empty file goes, its path printed.
+func TestMigrateV10(t *testing.T) {
+	d := dbtest.New(t)
+	tagged := dbtest.AddFile(t, d, "/m/tagged.txt", "harbor")
+	dbtest.AddFile(t, d, "/m/copy.txt", "harbor")
+	alone := dbtest.AddFile(t, d, "/m/alone.txt", "meadow")
+	unhashed := dbtest.AddFile(t, d, "/m/unhashed.txt", "clover")
+	empty := dbtest.AddFile(t, d, "/m/empty", "")
+	emptyUnhashed := dbtest.AddFile(t, d, "/m/empty-unhashed", "")
+	dir, _, _ := db.DirByPath(d, "/m")
+	stmts := []string{dbtest.FileTagsV10,
+		"DELETE FROM schema_version", "INSERT INTO schema_version (version) VALUES (10)",
+		"INSERT INTO tag (id, name) VALUES (1, 'amber'), (2, 'velvet')",
+		fmt.Sprintf("UPDATE instance SET file_id = NULL WHERE id IN (%d, %d)", unhashed, emptyUnhashed),
+		fmt.Sprintf("INSERT INTO file_tag (tag_id, instance_id) VALUES (1, %d), (2, %d), (1, %d), (1, %d), (1, %d), (2, %d)",
+			tagged, tagged, alone, unhashed, empty, emptyUnhashed),
+		fmt.Sprintf("INSERT INTO dir_tag (tag_id, dir_id) VALUES (2, %d)", *dir),
+	}
+	for _, q := range stmts {
+		if _, err := d.Exec(q); err != nil {
+			t.Fatal(q, err)
+		}
+	}
+	var out strings.Builder
+	if err := d.Upgrade(&out); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.RequireSchema(); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Dropping tag #amber from empty file: /m/empty\n",
+		"Dropping tag #velvet from empty file: /m/empty-unhashed\n",
+		"2 copies gained a tag", // copy.txt, once per tag of tagged.txt
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("output lacks %q: %q", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "schema v10") {
+		t.Errorf("a v10 DB ran the v10 step: %q", out.String())
+	}
+	for path, want := range map[string]string{
+		"tagged.txt":   "amber velvet",
+		"copy.txt":     "amber velvet",
+		"alone.txt":    "amber",
+		"unhashed.txt": "amber",
+	} {
+		tags, err := d.EntryTags("/m", []string{path})
+		if err != nil || strings.Join(tags[path], " ") != want {
+			t.Errorf("%s: tags %v, %v, want %s", path, tags[path], err, want)
+		}
+	}
+	for _, name := range []string{"empty", "empty-unhashed"} {
+		if tags, err := d.EntryTags("/m", []string{name}); err != nil || len(tags) != 0 {
+			t.Errorf("%s: tags %v, %v", name, tags, err)
+		}
+	}
+	var pending, gone, table int
+	d.QueryRow("SELECT COUNT(*) FROM pending_tag").Scan(&pending)
+	d.QueryRow("SELECT COUNT(*) FROM content_tag WHERE gone_at IS NOT NULL").Scan(&gone)
+	d.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('file_tag', 'idx_file_tag_instance_id')").Scan(&table)
+	if pending != 1 || gone != 0 || table != 0 {
+		t.Errorf("pending = %d, gone = %d, old objects left = %d", pending, gone, table)
+	}
+	// dir tags are left as they were
+	if subdirs, err := d.EntryTags("/", []string{"m"}); err != nil || strings.Join(subdirs["m"], " ") != "velvet" {
+		t.Errorf("dir tags %v, %v", subdirs, err)
+	}
+	// an upgraded DB ends up with the same objects as a new one
+	if got, want := schemaObjects(t, d), schemaObjects(t, dbtest.New(t)); !slices.Equal(got, want) {
+		t.Errorf("objects:\n got %v\nwant %v", got, want)
+	}
+}
+
+func schemaObjects(t *testing.T, d *db.DB) []string {
+	t.Helper()
+	rows, err := d.Query("SELECT type || ' ' || name FROM sqlite_master ORDER BY 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// RemoveInstance is API only (paras-commander's delete); the CLI removes dir trees.
+func TestRemoveInstanceKeepsContentTag(t *testing.T) {
+	d := dbtest.New(t)
+	id := dbtest.AddFile(t, d, "/m/a.txt", "harbor")
+	if _, err := d.AddTags(db.TagTarget{Instances: []int64{id}}, []string{"amber"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.RemoveInstance("/m/a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	var gone int
+	if err := d.QueryRow("SELECT COUNT(*) FROM content_tag WHERE gone_at IS NOT NULL").Scan(&gone); err != nil || gone != 1 {
+		t.Errorf("rows with gone_at = %d, %v", gone, err)
+	}
+	sha := sha256.Sum256([]byte("harbor"))
+	sum := hex.EncodeToString(sha[:])
+	if _, err := d.CommitScanBatch([]db.ScannedFile{{Dir: "/n", Name: "b.txt", Size: 6, Mtime: time.Unix(1700000000, 0), MD5: sum[:32], SHA256: sum}}); err != nil {
+		t.Fatal(err)
+	}
+	if tags, err := d.EntryTags("/n", []string{"b.txt"}); err != nil || len(tags["b.txt"]) != 1 {
+		t.Errorf("tags where the content came back = %v, %v", tags, err)
+	}
+	if err := d.QueryRow("SELECT COUNT(*) FROM content_tag WHERE gone_at IS NOT NULL").Scan(&gone); err != nil || gone != 0 {
+		t.Errorf("rows with gone_at after it came back = %d, %v", gone, err)
 	}
 }

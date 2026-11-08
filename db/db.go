@@ -1,4 +1,4 @@
-// Package db holds the schema v10 SQLite index and every query on it.
+// Package db holds the schema v11 SQLite index and every query on it.
 //
 // Read TIMESTAMP columns (mtime, created_at, last_seen) as CAST(col AS TEXT):
 // the driver otherwise parses them into time.Time and reformats them.
@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const SchemaVersion = 10
+const SchemaVersion = 11
 
 // Querier is satisfied by *sql.DB and *sql.Tx, so helpers can run inside a caller's transaction.
 type Querier interface {
@@ -87,14 +87,7 @@ CREATE TABLE tag (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-CREATE TABLE file_tag (
-    tag_id INTEGER NOT NULL,
-    instance_id INTEGER NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (tag_id) REFERENCES tag(id) ON DELETE CASCADE,
-    FOREIGN KEY (instance_id) REFERENCES instance(id) ON DELETE CASCADE,
-    UNIQUE(tag_id, instance_id)
-);
+` + contentTagSchema + `
 CREATE TABLE dir_tag (
     tag_id INTEGER NOT NULL,
     dir_id INTEGER,
@@ -107,9 +100,31 @@ CREATE INDEX idx_file_sha256 ON file(sha256);
 CREATE INDEX idx_file_sha256_noexif_jpeg ON file(sha256_noexif_jpeg);
 CREATE INDEX idx_file_sha256_8kb ON file(sha256_8kb);
 CREATE INDEX idx_file_size ON file(filesize);
-CREATE INDEX idx_file_tag_instance_id ON file_tag(instance_id);
 CREATE INDEX idx_dir_tag_dir_id ON dir_tag(dir_id);
-` + instanceIndexes + ftsSchema + `INSERT INTO schema_version (version) VALUES (10);
+` + instanceIndexes + ftsSchema + `INSERT INTO schema_version (version) VALUES (11);
+`
+
+// contentTagSchema holds file tags. A content tag is keyed by sha256, not file.id:
+// file rows are swept as orphans, and the tag must outlive that, so a move or a
+// rescan finds it again. gone_at is set while no file row has the content, by the
+// sites that delete and insert file rows (markGone, CommitScanBatch): a trigger on
+// file nearly doubled the cost of a scan batch, even one that never fired an UPDATE.
+// A pending tag holds the tag of an instance with no content yet, until its hash
+// lands (CommitScanBatch). pending_tag has a rowid because instance deletes cascade
+// into it, and a cascade into a WITHOUT ROWID table made pruning 12% slower.
+const contentTagSchema = `CREATE TABLE content_tag (
+    tag_id INTEGER NOT NULL REFERENCES tag(id) ON DELETE CASCADE,
+    sha256 TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    gone_at TIMESTAMP,
+    PRIMARY KEY (sha256, tag_id)
+) WITHOUT ROWID;
+CREATE TABLE pending_tag (
+    tag_id INTEGER NOT NULL REFERENCES tag(id) ON DELETE CASCADE,
+    instance_id INTEGER NOT NULL REFERENCES instance(id) ON DELETE CASCADE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(instance_id, tag_id)
+);
 `
 
 // instanceDDL is the instance table under the given name. file_id is NULL while
@@ -201,6 +216,72 @@ DROP INDEX IF EXISTS idx_dir_tag_tag_id;
 INSERT INTO schema_version (version) VALUES (10);
 `
 
+// migrateV10 moves file tags from instances to content: hashed instances give
+// content tags, unhashed ones pending tags. Every empty file is the same content,
+// so a tag on one is dropped, its path printed first.
+func (d *DB) migrateV10(w io.Writer) error {
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT i.dir_id, i.filename, t.name FROM file_tag ft
+JOIN instance i ON i.id = ft.instance_id JOIN tag t ON t.id = ft.tag_id
+LEFT JOIN file f ON f.id = i.file_id WHERE COALESCE(f.filesize, i.size) = 0 ORDER BY i.dir_id, i.filename, t.name`)
+	if err != nil {
+		return err
+	}
+	type dropped struct {
+		dir       int64
+		name, tag string
+	}
+	var empties []dropped
+	for rows.Next() {
+		var e dropped
+		if err := rows.Scan(&e.dir, &e.name, &e.tag); err != nil {
+			rows.Close()
+			return err
+		}
+		empties = append(empties, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	paths := dirPaths{}
+	for _, e := range empties {
+		p, err := paths.file(tx, e.dir, e.name)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(w, "Dropping tag #%s from empty file: %s\n", e.tag, p)
+	}
+	if _, err := tx.Exec(contentTagSchema + `
+INSERT OR IGNORE INTO content_tag (tag_id, sha256, created_at)
+SELECT ft.tag_id, f.sha256, MIN(ft.created_at) FROM file_tag ft
+JOIN instance i ON i.id = ft.instance_id JOIN file f ON f.id = i.file_id
+WHERE f.filesize > 0 GROUP BY ft.tag_id, f.sha256;
+INSERT INTO pending_tag (tag_id, instance_id, created_at)
+SELECT ft.tag_id, i.id, ft.created_at FROM file_tag ft
+JOIN instance i ON i.id = ft.instance_id WHERE i.file_id IS NULL AND i.size > 0;`); err != nil {
+		return err
+	}
+	var gained int64
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM content_tag ct CROSS JOIN file f ON f.sha256 = ct.sha256
+CROSS JOIN instance i ON i.file_id = f.id
+WHERE NOT EXISTS (SELECT 1 FROM file_tag ft WHERE ft.tag_id = ct.tag_id AND ft.instance_id = i.id)`).Scan(&gained); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DROP TABLE file_tag; INSERT INTO schema_version (version) VALUES (11);"); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "File tags now belong to content and apply to all copies: %d copies gained a tag.\n", gained)
+	return nil
+}
+
 // migrateV7 rebuilds instance for the current schema, going straight to v9 since
 // instanceDDL already has v9's column (SQLite cannot drop NOT NULL in
 // place): file_id becomes nullable and size is copied from the file row. Ids are
@@ -259,7 +340,7 @@ func (d *DB) Init() error {
 	return d.RequireSchema()
 }
 
-// Upgrade migrates a v6, v7, v8 or v9 DB to the current schema, announced on w
+// Upgrade migrates a v6 to v10 DB to the current schema, announced on w
 // since rebuilding the FTS indexes takes minutes on millions of instances. A DB
 // already current is left alone.
 func (d *DB) Upgrade(w io.Writer) error {
@@ -273,14 +354,25 @@ func (d *DB) Upgrade(w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if v.Int64 == 6 {
+	if v.Int64 < 10 {
+		if err := d.upgradeToV10(w, v.Int64); err != nil {
+			return err
+		}
+	}
+	fmt.Fprintln(w, "Migrating database to schema v11 (tags follow content)...")
+	return d.migrateV10(w)
+}
+
+// upgradeToV10 runs the migrations up to v10 from a v6, v7, v8 or v9 DB.
+func (d *DB) upgradeToV10(w io.Writer, v int64) error {
+	if v == 6 {
 		fmt.Fprintln(w, "Migrating database to schema v7 (full-text search)...")
 		if err := d.execTx(migrateV6); err != nil {
 			return err
 		}
-		v.Int64 = 7
+		v = 7
 	}
-	switch v.Int64 {
+	switch v {
 	case 7:
 		fmt.Fprintln(w, "Migrating database to schema v9 (files indexed before hashing, fast hashes)...")
 		if err := d.migrateV7(); err != nil {
@@ -293,7 +385,7 @@ func (d *DB) Upgrade(w io.Writer) error {
 		}
 	case 9:
 	default:
-		return fmt.Errorf("Database schema v%d is too old to upgrade, expected at least v6", v.Int64)
+		return fmt.Errorf("Database schema v%d is too old to upgrade, expected at least v6", v)
 	}
 	fmt.Fprintln(w, "Migrating database to schema v10 (redundant indexes dropped)...")
 	if err := d.execTx(migrateV9); err != nil {
@@ -393,9 +485,33 @@ func (d *DB) Vacuum() error {
 
 // DeleteOrphanedFiles deletes every file row no instance references, across the whole DB.
 func (d *DB) DeleteOrphanedFiles() (int64, error) {
-	res, err := d.Exec("DELETE FROM file WHERE NOT EXISTS (SELECT 1 FROM instance WHERE file_id = file.id)")
+	tx, err := d.Begin()
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	defer tx.Rollback()
+	res, err := tx.Exec("DELETE FROM file WHERE NOT EXISTS (SELECT 1 FROM instance WHERE file_id = file.id)")
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := markGone(tx, n); err != nil {
+		return 0, err
+	}
+	return n, tx.Commit()
+}
+
+// markGone stamps the content tags whose content lost its last file row, after
+// deleted file rows were deleted. It looks at each content tag once, so it suits
+// sweeps; RemoveInstance stamps its one sha256 directly.
+func markGone(q Querier, deleted int64) error {
+	if deleted == 0 {
+		return nil
+	}
+	_, err := q.Exec(`UPDATE content_tag SET gone_at = CURRENT_TIMESTAMP WHERE gone_at IS NULL
+AND NOT EXISTS (SELECT 1 FROM file f WHERE f.sha256 = content_tag.sha256)`)
+	return err
 }

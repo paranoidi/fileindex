@@ -50,12 +50,32 @@ func (a *app) tagTarget(d *db.DB, path string, recursive bool) (db.TagTarget, er
 	return db.TagTarget{}, fmt.Errorf("Path is not a file or directory: %s", path)
 }
 
+// reportOtherCopies says how many files outside the target a tag change reached.
+func (a *app) reportOtherCopies(d *db.DB, target db.TagTarget) error {
+	n, err := d.OtherCopies(target)
+	switch {
+	case err != nil:
+		return err
+	case n == 1:
+		fmt.Fprintln(a.stdout, "Also applies to 1 other copy")
+	case n > 1:
+		fmt.Fprintf(a.stdout, "Also applies to %d other copies\n", n)
+	}
+	return nil
+}
+
 func tagCmd(a *app) *cobra.Command {
 	var recursive bool
 	cmd := &cobra.Command{
 		Use:   "tag [add|remove] PATH TAG...",
-		Short: "Add or remove tags on a file or directory",
-		Args:  cobra.MinimumNArgs(2),
+		Short: "Add or remove tags on a file's content or a directory",
+		Long: `Add or remove tags on a file's content or a directory.
+
+A file's tag belongs to its content: every copy has it, moving or renaming keeps it,
+and an edited file keeps it. Removing a tag removes it from every copy. Empty files
+can't be tagged, since they are all the same content. A directory's tag stays on that
+directory record.`,
+		Args: cobra.MinimumNArgs(2),
 		RunE: func(_ *cobra.Command, args []string) error {
 			op := "add"
 			if args[0] == "add" || args[0] == "remove" {
@@ -78,14 +98,27 @@ func tagCmd(a *app) *cobra.Command {
 				return err
 			}
 			if op == "add" {
+				empty, err := d.EmptyInstances(target)
+				if err != nil {
+					return err
+				}
+				if empty == 1 && !recursive {
+					return fmt.Errorf("Empty files can't be tagged: %s", path)
+				}
 				n, err := d.AddTags(target, tags)
 				if err != nil {
 					return err
 				}
 				if n > 0 {
 					fmt.Fprintf(a.stdout, "Added %d tag(s) %s to %s\n", n, hashTags(tags), path)
+					if err := a.reportOtherCopies(d, target); err != nil {
+						return err
+					}
 				} else {
 					fmt.Fprintf(a.stdout, "Tags %s already applied to %s\n", hashTags(tags), path)
+				}
+				if empty > 0 {
+					fmt.Fprintf(a.stdout, "Skipped %d empty file(s)\n", empty)
 				}
 				return nil
 			}
@@ -102,8 +135,9 @@ func tagCmd(a *app) *cobra.Command {
 			}
 			if len(removed) == 0 {
 				fmt.Fprintf(a.stdout, "No tags %s found on %s\n", hashTags(tags), path)
+				return nil
 			}
-			return nil
+			return a.reportOtherCopies(d, target)
 		},
 	}
 	cmd.Flags().BoolVarP(&recursive, "recursive", "r", false, "Apply to the directory, its subdirectories and all their files")

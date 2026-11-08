@@ -188,7 +188,9 @@ type DiscoveredFile struct {
 // the dirs the walk entered (absolute, resolved, in walk order), in one
 // transaction, so the files are findable by name at once. An existing instance
 // gets the new size and mtime and loses its file_id and fast hash: a stale hash never
-// survives a change. One INSERT writes all new instances (see CommitScanBatch).
+// survives a change. Its content's tags stay on that content and go to the instance as
+// pending tags, for the new content to inherit. One INSERT writes all new instances
+// (see CommitScanBatch).
 func (d *DB) CommitDiscovered(files []DiscoveredFile, dirs []string) (BatchResult, error) {
 	res := BatchResult{Failed: map[int]error{}}
 	tx, err := d.Begin()
@@ -198,6 +200,10 @@ func (d *DB) CommitDiscovered(files []DiscoveredFile, dirs []string) (BatchResul
 	defer tx.Rollback()
 	q := &stmtCache{tx: tx, stmts: map[string]*sql.Stmt{}}
 	if err := recordDirs(q, dirs); err != nil {
+		return res, err
+	}
+	var tagged bool
+	if err := q.QueryRow("SELECT EXISTS (SELECT 1 FROM content_tag)").Scan(&tagged); err != nil {
 		return res, err
 	}
 	dirIDs := map[string]*int64{}
@@ -217,6 +223,12 @@ func (d *DB) CommitDiscovered(files []DiscoveredFile, dirs []string) (BatchResul
 		switch err {
 		case nil:
 			res.Updated++
+			if tagged { // before file_id goes: the new content inherits the old one's tags
+				if _, err := q.Exec(`INSERT OR IGNORE INTO pending_tag (tag_id, instance_id) SELECT ct.tag_id, i.id FROM instance i
+CROSS JOIN file f ON f.id = i.file_id CROSS JOIN content_tag ct ON ct.sha256 = f.sha256 WHERE i.id = ?`, instID); err != nil {
+					return res, err
+				}
+			}
 			_, err = q.Exec("UPDATE instance SET file_id = NULL, sha256_8kb = NULL, size = ?, mtime = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?", f.Size, mtime, instID)
 		case sql.ErrNoRows:
 			k := newKey{dirID, f.Name}
@@ -422,6 +434,7 @@ func (d *DB) CommitScanBatch(files []ScannedFile) (BatchResult, error) {
 	dirs := map[string]*int64{} // a batch is mostly a few dirs; resolve each once
 	var newRows [][]any         // instances to insert, in one statement at the end
 	added := map[newKey]int{}   // index into newRows
+	var newContent []string     // sha256 of each new file row
 	dirOf := func(dir string) (*int64, error) {
 		id, ok := dirs[dir]
 		if !ok {
@@ -467,6 +480,7 @@ sha256_noexif_jpeg = CASE WHEN ? THEN ? ELSE sha256_noexif_jpeg END WHERE id = ?
 				f.MD5, f.SHA256, f.NoExifJPEG, f.SHA256_8KB, f.Size)
 			if err == nil {
 				fileID, err = r.LastInsertId()
+				newContent = append(newContent, f.SHA256)
 			}
 		}
 		if err != nil {
@@ -500,6 +514,13 @@ sha256_noexif_jpeg = CASE WHEN ? THEN ? ELSE sha256_noexif_jpeg END WHERE id = ?
 			return res, err
 		}
 	}
+	// Before the FTS writes below, as statements after them flush FTS segments.
+	if err := markBack(q, newContent); err != nil {
+		return res, err
+	}
+	if err := promotePending(q); err != nil {
+		return res, err
+	}
 	// One statement for all new instances: FTS5 flushes its pending terms to
 	// a new segment at every statement savepoint, so a per-row INSERT (its
 	// triggers need one) wrote and merged an FTS segment per file.
@@ -507,6 +528,40 @@ sha256_noexif_jpeg = CASE WHEN ? THEN ? ELSE sha256_noexif_jpeg END WHERE id = ?
 		return res, err
 	}
 	return res, tx.Commit()
+}
+
+// markBack clears gone_at on the content tags of new file rows: their content returned.
+func markBack(q Querier, shas []string) error {
+	if len(shas) == 0 {
+		return nil
+	}
+	var some bool
+	if err := q.QueryRow("SELECT EXISTS (SELECT 1 FROM content_tag)").Scan(&some); err != nil || !some {
+		return err
+	}
+	list, err := json.Marshal(shas)
+	if err != nil {
+		return err
+	}
+	_, err = q.Exec("UPDATE content_tag SET gone_at = NULL WHERE gone_at IS NOT NULL AND sha256 IN (SELECT value FROM json_each(?))", string(list))
+	return err
+}
+
+// promotePending turns the pending tags of instances that now have content into
+// content tags. Empty content takes no tags, so those pending tags just end.
+func promotePending(q Querier) error {
+	var some bool
+	if err := q.QueryRow("SELECT EXISTS (SELECT 1 FROM pending_tag)").Scan(&some); err != nil || !some {
+		return err
+	}
+	if _, err := q.Exec(`INSERT OR IGNORE INTO content_tag (tag_id, sha256, created_at)
+SELECT p.tag_id, f.sha256, p.created_at FROM pending_tag p CROSS JOIN instance i ON i.id = p.instance_id
+CROSS JOIN file f ON f.id = i.file_id WHERE f.filesize > 0`); err != nil {
+		return err
+	}
+	_, err := q.Exec(`DELETE FROM pending_tag WHERE instance_id IN
+(SELECT p.instance_id FROM pending_tag p CROSS JOIN instance i ON i.id = p.instance_id WHERE i.file_id IS NOT NULL)`)
+	return err
 }
 
 // newKey identifies an instance CommitScanBatch is about to insert.
@@ -571,6 +626,10 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 	defer func() { tx.Rollback() }() // the tx current at return; a no-op once committed
 	q := &stmtCache{tx: tx, stmts: map[string]*sql.Stmt{}}
 	pending := int64(0) // deletions since the last commit
+	var hasPending bool
+	if err := q.QueryRow("SELECT EXISTS (SELECT 1 FROM pending_tag)").Scan(&hasPending); err != nil {
+		return 0, 0, err
+	}
 	flush := func() error {
 		if pending < pruneBatch {
 			return nil
@@ -640,6 +699,11 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 			if err != nil {
 				return files, dirs, err
 			}
+			if hasPending {
+				if err := logLostPendingFiles(q, cur.path, cur.id, string(list), log); err != nil {
+					return files, dirs, err
+				}
+			}
 			r, err := tx.Exec("DELETE FROM instance WHERE dir_id = ? AND filename IN (SELECT value FROM json_each(?))", cur.id, string(list))
 			if err != nil {
 				return files, dirs, err
@@ -680,6 +744,11 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 				stack = append(stack, s)
 				continue
 			}
+			if hasPending {
+				if err := logLostPendingTree(q, s.path, s.id, log); err != nil {
+					return files, dirs, err
+				}
+			}
 			f, n, err := deleteTree(tx, s.id)
 			if err != nil {
 				return files, dirs, err
@@ -692,6 +761,36 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 		}
 	}
 	return files, dirs, tx.Commit()
+}
+
+// logLostPendingFiles logs the pending tags of the named instances of a dir about
+// to lose them: the file went before its hash landed, so the tag has no content to stay on.
+func logLostPendingFiles(q Querier, dir string, id int64, names string, log func(string)) error {
+	rows, err := q.Query(`SELECT i.filename, t.name FROM instance i CROSS JOIN pending_tag p ON p.instance_id = i.id
+CROSS JOIN tag t ON t.id = p.tag_id WHERE i.dir_id = ? AND i.filename IN (SELECT value FROM json_each(?)) ORDER BY 1, 2`, id, names)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name, tag string
+		if err := rows.Scan(&name, &tag); err != nil {
+			return err
+		}
+		log("Lost tag #" + tag + " on unhashed file: " + filepath.Join(dir, name))
+	}
+	return rows.Err()
+}
+
+// logLostPendingTree logs how many pending tags are lost with the dir tree at path.
+func logLostPendingTree(q Querier, path string, id int64, log func(string)) error {
+	var n int
+	err := q.QueryRow(treeCTE+`SELECT COUNT(*) FROM dir_tree t CROSS JOIN instance i ON i.dir_id = t.id
+CROSS JOIN pending_tag p ON p.instance_id = i.id`, id).Scan(&n)
+	if err == nil && n > 0 {
+		log(fmt.Sprintf("Lost %d tag(s) on unhashed files under: %s", n, path))
+	}
+	return err
 }
 
 func (d *DB) strings(query string, args ...any) ([]string, error) {
@@ -853,7 +952,11 @@ AND NOT EXISTS (SELECT 1 FROM instance WHERE file_id = file.id)`, string(list))
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, markGone(q, n)
 }
 
 // RemoveInstance deletes the instance at the absolute file path and its file
@@ -891,10 +994,17 @@ func (d *DB) RemoveInstance(path string) (RemovedTree, error) {
 	if !fileID.Valid {
 		return r, tx.Commit()
 	}
-	res, err := tx.Exec("DELETE FROM file WHERE id = ? AND NOT EXISTS (SELECT 1 FROM instance WHERE file_id = ?)", fileID.Int64, fileID.Int64)
+	var sha string
+	err = tx.QueryRow("DELETE FROM file WHERE id = ? AND NOT EXISTS (SELECT 1 FROM instance WHERE file_id = ?) RETURNING sha256", fileID.Int64, fileID.Int64).Scan(&sha)
+	if err == sql.ErrNoRows { // another instance still has this content
+		return r, tx.Commit()
+	}
 	if err != nil {
 		return r, err
 	}
-	r.Files, _ = res.RowsAffected()
+	r.Files = 1
+	if _, err := tx.Exec("UPDATE content_tag SET gone_at = CURRENT_TIMESTAMP WHERE sha256 = ?", sha); err != nil {
+		return r, err
+	}
 	return r, tx.Commit()
 }

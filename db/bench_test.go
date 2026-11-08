@@ -219,3 +219,80 @@ func BenchmarkRescan(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkListDirTagged lists a dir of 5k files, a fifth of them tagged, and one
+// without tags, where fileTagsByName skips the query.
+func BenchmarkListDirTagged(b *testing.B) {
+	for _, bc := range []struct {
+		name   string
+		tagged bool
+	}{{"untagged", false}, {"tagged", true}} {
+		b.Run(bc.name, func(b *testing.B) {
+			d := dbtest.New(b)
+			files := make([]db.ScannedFile, 5000)
+			for i := range files {
+				s := fmt.Sprintf("%064d", i)
+				files[i] = db.ScannedFile{Dir: "/m/d", Name: fmt.Sprintf("f%d", i), Size: 1, Mtime: time.Unix(1700000000, 0), MD5: s[32:], SHA256: s}
+			}
+			if _, err := d.CommitScanBatch(files); err != nil {
+				b.Fatal(err)
+			}
+			id, _, err := db.DirByPath(d, "/m/d")
+			if err != nil {
+				b.Fatal(err)
+			}
+			if bc.tagged {
+				var t db.TagTarget
+				for i := range 1000 {
+					inst, _, err := d.InstanceID(fmt.Sprintf("/m/d/f%d", i*5))
+					if err != nil {
+						b.Fatal(err)
+					}
+					t.Instances = append(t.Instances, inst)
+				}
+				if _, err := d.AddTags(t, []string{"amber", "velvet"}); err != nil {
+					b.Fatal(err)
+				}
+			}
+			for b.Loop() {
+				if files, _, err := d.ListDir(*id); err != nil || len(files) != 5000 {
+					b.Fatal(len(files), err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkRescanAll rewalks and rehashes 2k files with -a, half of them tagged.
+func BenchmarkRescanAll(b *testing.B) {
+	d := dbtest.New(b)
+	root := b.TempDir()
+	for i := range 2000 {
+		dir := filepath.Join(root, fmt.Sprintf("a%d", i/200))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			b.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%d", i)), fmt.Append(nil, i), 0o644); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if _, err := scan.Run(context.Background(), d, []string{root}, scan.Options{MissingOnly: true}, nopReporter{}); err != nil {
+		b.Fatal(err)
+	}
+	var t db.TagTarget
+	for i := range 1000 {
+		inst, _, err := d.InstanceID(filepath.Join(root, fmt.Sprintf("a%d", i*2/200), fmt.Sprintf("f%d", i*2)))
+		if err != nil {
+			b.Fatal(err)
+		}
+		t.Instances = append(t.Instances, inst)
+	}
+	if _, err := d.AddTags(t, []string{"amber"}); err != nil {
+		b.Fatal(err)
+	}
+	for b.Loop() {
+		if _, err := scan.Run(context.Background(), d, []string{root}, scan.Options{}, nopReporter{}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

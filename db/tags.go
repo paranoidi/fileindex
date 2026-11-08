@@ -3,6 +3,7 @@ package db
 import (
 	"cmp"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"slices"
 )
@@ -77,7 +78,10 @@ func (d *DB) TreeTarget(dir int64) (TagTarget, error) {
 }
 
 // AddTags tags every target with every name, creating tags as needed, and
-// returns how many new associations were made.
+// returns how many new associations were made. An instance's tag goes on its
+// content, so copies share it (and share one association); an unhashed instance
+// holds a pending tag until its hash lands. Empty files are skipped: all of them
+// are the same content (EmptyInstances counts them).
 func (d *DB) AddTags(t TagTarget, names []string) (int, error) {
 	tx, err := d.Begin()
 	if err != nil {
@@ -92,23 +96,74 @@ func (d *DB) AddTags(t TagTarget, names []string) (int, error) {
 		}
 		tags = append(tags, id)
 	}
+	q := &stmtCache{tx: tx, stmts: map[string]*sql.Stmt{}}
 	added := 0
-	for _, pass := range []struct {
-		table, col string
-		ids        []int64
-	}{{"dir_tag", "dir_id", t.Dirs}, {"file_tag", "instance_id", t.Instances}} {
-		for _, id := range pass.ids {
-			for _, tag := range tags {
-				r, err := tx.Exec("INSERT OR IGNORE INTO "+pass.table+" (tag_id, "+pass.col+") VALUES (?, ?)", tag, id)
-				if err != nil {
-					return 0, err
-				}
-				n, _ := r.RowsAffected()
-				added += int(n)
+	add := func(query string, key any) error {
+		for _, tag := range tags {
+			r, err := q.Exec(query, tag, key)
+			if err != nil {
+				return err
 			}
+			n, _ := r.RowsAffected()
+			added += int(n)
+		}
+		return nil
+	}
+	for _, id := range t.Dirs {
+		if err := add("INSERT OR IGNORE INTO dir_tag (tag_id, dir_id) VALUES (?, ?)", id); err != nil {
+			return 0, err
+		}
+	}
+	for _, id := range t.Instances {
+		size, sha, err := instanceContent(q, id)
+		if err != nil {
+			return 0, err
+		}
+		switch {
+		case size == 0:
+		case sha.Valid:
+			err = add("INSERT OR IGNORE INTO content_tag (tag_id, sha256) VALUES (?, ?)", sha.String)
+		default:
+			err = add("INSERT OR IGNORE INTO pending_tag (tag_id, instance_id) VALUES (?, ?)", id)
+		}
+		if err != nil {
+			return 0, err
 		}
 	}
 	return added, tx.Commit()
+}
+
+// instanceContent returns an instance's size and its content's sha256 (invalid while unhashed).
+func instanceContent(q Querier, id int64) (int64, sql.NullString, error) {
+	var size int64
+	var sha sql.NullString
+	err := q.QueryRow("SELECT i.size, f.sha256 FROM instance i LEFT JOIN file f ON f.id = i.file_id WHERE i.id = ?", id).Scan(&size, &sha)
+	return size, sha, err
+}
+
+// EmptyInstances counts the target's empty files, which AddTags skips.
+func (d *DB) EmptyInstances(t TagTarget) (int, error) {
+	list, err := json.Marshal(t.Instances)
+	if err != nil {
+		return 0, err
+	}
+	var n int
+	err = d.QueryRow("SELECT COUNT(*) FROM instance WHERE size = 0 AND id IN (SELECT value FROM json_each(?))", string(list)).Scan(&n)
+	return n, err
+}
+
+// OtherCopies counts the instances outside the target that share content with a
+// file in it, so a tag change on the target reaches them too.
+func (d *DB) OtherCopies(t TagTarget) (int, error) {
+	list, err := json.Marshal(t.Instances)
+	if err != nil {
+		return 0, err
+	}
+	var n int
+	err = d.QueryRow(`WITH target(id) AS (SELECT value FROM json_each(?1))
+SELECT COUNT(*) FROM instance o WHERE o.id NOT IN (SELECT id FROM target) AND o.file_id IN
+(SELECT f.id FROM target t CROSS JOIN instance i ON i.id = t.id CROSS JOIN file f ON f.id = i.file_id WHERE f.filesize > 0)`, string(list)).Scan(&n)
+	return n, err
 }
 
 // Removed is one association removed by RemoveTags.
@@ -117,9 +172,10 @@ type Removed struct {
 	IsDir     bool
 }
 
-// RemoveTags removes the named tags from every target. Unknown tag names are
-// skipped. Results list dirs then files, each sorted by path, tags
-// in argument order.
+// RemoveTags removes the named tags from every target; for a file that means its
+// content, so copies outside the target lose them too (OtherCopies counts those).
+// Unknown tag names are skipped. Results list dirs then the targeted files, each
+// sorted by path, tags in argument order.
 func (d *DB) RemoveTags(t TagTarget, names []string) ([]Removed, error) {
 	tags, found, err := tagIDs(d, names)
 	if err != nil || len(tags) == 0 {
@@ -130,40 +186,59 @@ func (d *DB) RemoveTags(t TagTarget, names []string) ([]Removed, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
+	q := &stmtCache{tx: tx, stmts: map[string]*sql.Stmt{}}
 	var dirs, files []Removed
 	paths := dirPaths{}
-	for _, pass := range []struct {
-		table, col string
-		ids        []int64
-		isDir      bool
-	}{{"dir_tag", "dir_id", t.Dirs, true}, {"file_tag", "instance_id", t.Instances, false}} {
-		for _, id := range pass.ids {
-			var path string
-			if pass.isDir {
-				path, err = paths.dir(tx, id)
-			} else {
-				var dir int64
-				var name string
-				if err = tx.QueryRow("SELECT dir_id, filename FROM instance WHERE id = ?", id).Scan(&dir, &name); err == nil {
-					path, err = paths.file(tx, dir, name)
-				}
-			}
+	for _, id := range t.Dirs {
+		path, err := paths.dir(tx, id)
+		if err != nil {
+			return nil, err
+		}
+		for i, tag := range tags {
+			r, err := q.Exec("DELETE FROM dir_tag WHERE tag_id = ? AND dir_id = ?", tag, id)
 			if err != nil {
 				return nil, err
 			}
-			for i, tag := range tags {
-				r, err := tx.Exec("DELETE FROM "+pass.table+" WHERE tag_id = ? AND "+pass.col+" = ?", tag, id)
-				if err != nil {
+			if n, _ := r.RowsAffected(); n > 0 {
+				dirs = append(dirs, Removed{Tag: found[i], Path: path, IsDir: true})
+			}
+		}
+	}
+	type contentKey struct {
+		tag int64
+		sha string
+	}
+	cleared := map[contentKey]bool{} // copies in the target share a row: each still reports it
+	for _, id := range t.Instances {
+		var dir int64
+		var name string
+		var sha sql.NullString
+		if err := q.QueryRow(`SELECT i.dir_id, i.filename, f.sha256 FROM instance i LEFT JOIN file f ON f.id = i.file_id
+WHERE i.id = ?`, id).Scan(&dir, &name, &sha); err != nil {
+			return nil, err
+		}
+		path, err := paths.file(tx, dir, name)
+		if err != nil {
+			return nil, err
+		}
+		for i, tag := range tags {
+			r, err := q.Exec("DELETE FROM pending_tag WHERE tag_id = ? AND instance_id = ?", tag, id)
+			if err != nil {
+				return nil, err
+			}
+			n, _ := r.RowsAffected()
+			hit := n > 0
+			if k := (contentKey{tag, sha.String}); sha.Valid {
+				if r, err = q.Exec("DELETE FROM content_tag WHERE tag_id = ? AND sha256 = ?", tag, sha.String); err != nil {
 					return nil, err
 				}
 				if n, _ := r.RowsAffected(); n > 0 {
-					rm := Removed{Tag: found[i], Path: path, IsDir: pass.isDir}
-					if pass.isDir {
-						dirs = append(dirs, rm)
-					} else {
-						files = append(files, rm)
-					}
+					cleared[k] = true
 				}
+				hit = hit || cleared[k]
+			}
+			if hit {
+				files = append(files, Removed{Tag: found[i], Path: path})
 			}
 		}
 	}
@@ -179,10 +254,16 @@ type TagCount struct {
 	Files, Dirs int
 }
 
+// taggedInstances selects the current instances carrying the tag whose id is the
+// expression tag: by content or pending. Tags on absent content match nothing.
+func taggedInstances(tag string) string {
+	return `SELECT i.id FROM content_tag ct CROSS JOIN file f ON f.sha256 = ct.sha256 CROSS JOIN instance i ON i.file_id = f.id
+WHERE ct.tag_id = ` + tag + ` UNION SELECT instance_id FROM pending_tag WHERE tag_id = ` + tag
+}
+
 func (d *DB) ListTags() ([]TagCount, error) {
-	rows, err := d.Query(`SELECT t.name, COUNT(DISTINCT ft.instance_id), COUNT(DISTINCT dt.dir_id)
-FROM tag t LEFT JOIN file_tag ft ON t.id = ft.tag_id LEFT JOIN dir_tag dt ON t.id = dt.tag_id
-GROUP BY t.id, t.name ORDER BY t.name`)
+	rows, err := d.Query(`SELECT t.name, (SELECT COUNT(*) FROM (` + taggedInstances("t.id") + `)),
+(SELECT COUNT(*) FROM dir_tag WHERE tag_id = t.id) FROM tag t ORDER BY t.name`)
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +288,7 @@ func (d *DB) DeleteTag(name string) (int, error) {
 		return 0, err
 	}
 	var n int
-	if err := d.QueryRow("SELECT (SELECT COUNT(*) FROM file_tag WHERE tag_id = ?1) + (SELECT COUNT(*) FROM dir_tag WHERE tag_id = ?1)", id).Scan(&n); err != nil {
+	if err := d.QueryRow("SELECT (SELECT COUNT(*) FROM ("+taggedInstances("?1")+")) + (SELECT COUNT(*) FROM dir_tag WHERE tag_id = ?1)", id).Scan(&n); err != nil {
 		return 0, err
 	}
 	_, err := d.Exec("DELETE FROM tag WHERE id = ?", id)
@@ -232,7 +313,9 @@ func (d *DB) FindByTags(dir int64, names []string, recursive bool) ([]string, er
 		instQ = treeCTE + "SELECT i.id, i.dir_id, i.filename FROM instance i WHERE i.dir_id IN (SELECT id FROM dir_tree)"
 		dirQ = treeCTE + "SELECT id FROM dir_tree WHERE id != ?1"
 	}
-	instQ += " AND (SELECT COUNT(DISTINCT tag_id) FROM file_tag WHERE instance_id = i.id AND tag_id IN (" + in + ")) = ?"
+	instQ += ` AND (SELECT COUNT(*) FROM tag t WHERE t.id IN (` + in + `) AND (
+EXISTS (SELECT 1 FROM file f CROSS JOIN content_tag ct ON ct.sha256 = f.sha256 AND ct.tag_id = t.id WHERE f.id = i.file_id)
+OR EXISTS (SELECT 1 FROM pending_tag p WHERE p.instance_id = i.id AND p.tag_id = t.id))) = ?`
 	rows, err := d.Query(instQ, append(append([]any{dir}, args...), need)...)
 	if err != nil {
 		return nil, err
@@ -313,8 +396,10 @@ func (d *DB) IndexTagTarget(path string, recursive bool) (TagTarget, error) {
 
 const (
 	// fileTags and subdirTags list (entry name, tag) for everything directly in a dir.
-	fileTags = `SELECT i.filename, t.name FROM instance i JOIN file_tag ft ON ft.instance_id = i.id
-JOIN tag t ON t.id = ft.tag_id WHERE i.dir_id = ? ORDER BY t.name`
+	fileTags = `SELECT i.filename, t.name FROM instance i CROSS JOIN file f ON f.id = i.file_id
+CROSS JOIN content_tag ct ON ct.sha256 = f.sha256 CROSS JOIN tag t ON t.id = ct.tag_id WHERE i.dir_id = ?1
+UNION SELECT i.filename, t.name FROM instance i CROSS JOIN pending_tag p ON p.instance_id = i.id
+CROSS JOIN tag t ON t.id = p.tag_id WHERE i.dir_id = ?1 ORDER BY 2`
 	subdirTags = `SELECT d.name, t.name FROM dir d JOIN dir_tag dt ON dt.dir_id = d.id
 JOIN tag t ON t.id = dt.tag_id WHERE d.parent_id = ? ORDER BY t.name`
 )
@@ -338,8 +423,21 @@ func (d *DB) tagsByName(query string, dir int64) (map[string][]string, error) {
 	return out, rows.Err()
 }
 
+// fileTagsByName is tagsByName(fileTags): the query walks every instance of the
+// dir, which an index without file tags can skip.
+func (d *DB) fileTagsByName(dir int64) (map[string][]string, error) {
+	var some bool
+	if err := d.QueryRow("SELECT EXISTS (SELECT 1 FROM content_tag) OR EXISTS (SELECT 1 FROM pending_tag)").Scan(&some); err != nil {
+		return nil, err
+	}
+	if !some {
+		return map[string][]string{}, nil
+	}
+	return d.tagsByName(fileTags, dir)
+}
+
 // EntryTags returns the tags of the named entries directly in the dir at path:
-// a file's from its instance, a subdir's from its dir row (both, if the index
+// a file's from its content or pending tags, a subdir's from its dir row (both, if the index
 // has both under one name). Untagged and unindexed names are left out. The
 // query count doesn't grow with the number of names.
 func (d *DB) EntryTags(dir string, names []string) (map[string][]string, error) {
@@ -348,7 +446,7 @@ func (d *DB) EntryTags(dir string, names []string) (map[string][]string, error) 
 	if err != nil || !found {
 		return out, err
 	}
-	files, err := d.tagsByName(fileTags, *id)
+	files, err := d.fileTagsByName(*id)
 	if err != nil {
 		return nil, err
 	}

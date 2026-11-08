@@ -16,7 +16,10 @@ _Avoid_: copy, path entry
 A directory node in the indexed tree; Dirs form a hierarchy from the filesystem root.
 
 **Tag**:
-A user-assigned label on an Instance or a Dir.
+A user-assigned label on a File's content or on a Dir. A File's Tag outlives its File: it applies again when the same content returns.
+
+**Pending tag**:
+A Tag held by an unhashed Instance until its hash lands, when it moves to the content.
 
 **Duplicate**:
 A File that has more than one Instance.
@@ -29,4 +32,4 @@ Instances with the same size and first 8 KB, at least one of them only fast-hash
 - A **File** has one or more hashed **Instances**; an unhashed **Instance** has no **File**
 - An **Instance** lives in exactly one **Dir**
 - A **Dir** has zero or one parent **Dir**
-- A **Tag** attaches to **Instances** and **Dirs**, not to **Files**
+- A **Tag** attaches to the content of a **File** and to **Dirs**, so every **Instance** of a **File** has its **Tags**

@@ -101,7 +101,7 @@ func TestFindOutdatedSchema(t *testing.T) {
 	if _, err := d.Exec("INSERT INTO schema_version (version) VALUES (6)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.Exec("DELETE FROM schema_version WHERE version = 10"); err != nil {
+	if _, err := d.Exec("DELETE FROM schema_version WHERE version = 11"); err != nil {
 		t.Fatal(err)
 	}
 	if code, _, errOut := h.run("find", "*", "/m"); code != 1 || !strings.Contains(errOut, "run `fileindex upgrade-db`") {
@@ -287,10 +287,7 @@ func TestLs(t *testing.T) {
 	writeFile(t, filepath.Join(tree, "a.jpg"), "aaa")
 	writeFile(t, filepath.Join(tree, "sub", "x.jpg"), "x")
 	h.mustRun("scan", tree)
-	inst := 0
-	d.QueryRow("SELECT id FROM instance WHERE filename = 'a.jpg'").Scan(&inst)
-	d.Exec("INSERT INTO tag (name) VALUES ('red'), ('blue')")
-	d.Exec("INSERT INTO file_tag (tag_id, instance_id) SELECT id, ? FROM tag", inst)
+	h.mustRun("tag", filepath.Join(tree, "a.jpg"), "red", "blue")
 	sub, _, _ := db.DirByPath(d, filepath.Join(tree, "sub"))
 	d.Exec("INSERT INTO dir_tag (tag_id, dir_id) SELECT id, ? FROM tag WHERE name = 'red'", *sub)
 

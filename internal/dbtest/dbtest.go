@@ -32,6 +32,20 @@ func Init(t testing.TB, p string) *db.DB {
 	return d
 }
 
+// FileTagsV10 turns a current schema's file tags back into v10's file_tag, as the
+// start of building a fixture for a migration.
+const FileTagsV10 = `DROP TABLE content_tag;
+DROP TABLE pending_tag;
+CREATE TABLE file_tag (
+    tag_id INTEGER NOT NULL,
+    instance_id INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (tag_id) REFERENCES tag(id) ON DELETE CASCADE,
+    FOREIGN KEY (instance_id) REFERENCES instance(id) ON DELETE CASCADE,
+    UNIQUE(tag_id, instance_id)
+);
+CREATE INDEX idx_file_tag_instance_id ON file_tag(instance_id);`
+
 // Mtime is the mtime AddFile stores.
 const Mtime = "2024-01-02 03:04:05"
 
