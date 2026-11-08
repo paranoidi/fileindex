@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -207,6 +208,34 @@ func tagsCmd(a *app) *cobra.Command {
 		},
 	})
 	return cmd
+}
+
+func tagGCCmd(a *app) *cobra.Command {
+	return &cobra.Command{
+		Use:   "tag-gc DAYS",
+		Short: "Delete tags on content that has been gone for more than DAYS days",
+		Long: `Delete tags on content that has been gone for more than DAYS days.
+
+A tag stays when its content leaves the index, so it can come back with the content.
+Nothing else deletes tags on age. 0 deletes the tags of all content currently gone.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			days, err := strconv.Atoi(args[0])
+			if err != nil || days < 0 {
+				return fmt.Errorf("DAYS must be a non-negative whole number: %s", args[0])
+			}
+			d, err := a.openDB()
+			if err != nil {
+				return err
+			}
+			n, err := d.TagGC(days)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(a.stdout, "Deleted %d tag(s) on content absent for more than %d day(s)\n", n, days)
+			return nil
+		},
+	}
 }
 
 func findTaggedCmd(a *app) *cobra.Command {

@@ -24,9 +24,9 @@ fileindex verify                # re-check indexed files against disk
 fileindex prune                 # forget files gone from disk
 ```
 
-Other commands: `diff`, `ls`, `tree`, `mv`, `remove`, `tag`/`tags`/`find-tagged`, `export`/`import` (CSV), `stats`, `vacuum`, `upgrade-db` (migrate the database after updating fileindex). See `fileindex <command> --help`.
+Other commands: `diff`, `ls`, `tree`, `mv`, `remove`, `tag`/`tags`/`find-tagged`/`tag-gc`, `export`/`import` (CSV), `stats`, `vacuum`, `upgrade-db` (migrate the database after updating fileindex). See `fileindex <command> --help`.
 
-A file's tags belong to its content: every copy has them, and moving, renaming or editing a file keeps them. Tagging or untagging one copy applies to all of them. Empty files can't be tagged. A directory's tags stay on that directory record, and are lost if it moves on disk. A tag stays when its content leaves the index, so it can come back with the content.
+A file's tags belong to its content: every copy has them, and moving, renaming or editing a file keeps them. Tagging or untagging one copy applies to all of them. Empty files can't be tagged. A directory's tags stay on that directory record, and are lost if it moves on disk. A tag stays when its content leaves the index, so it can come back with the content; `tag-gc DAYS` deletes the tags of content gone for more than DAYS days.
 
 ## Scanning
 
