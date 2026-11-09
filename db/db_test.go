@@ -107,8 +107,8 @@ func TestInitSchema(t *testing.T) {
 	d := dbtest.New(t)
 	var n int
 	d.QueryRow("SELECT COUNT(*) FROM sqlite_master").Scan(&n)
-	if n != 34 { // 9 tables + 7 indexes + 6 autoindexes + 2 FTS tables, their 7 shadow tables, 3 triggers
-		t.Errorf("sqlite_master rows = %d, want 34", n)
+	if n != 37 { // 12 tables + 7 indexes + 6 autoindexes + 2 FTS tables, their 7 shadow tables, 3 triggers
+		t.Errorf("sqlite_master rows = %d, want 37", n)
 	}
 	var mode string
 	d.QueryRow("PRAGMA journal_mode").Scan(&mode)
@@ -1426,4 +1426,31 @@ func TestUnsampledInstances(t *testing.T) {
 	if n, err := d.UnsampledInstances(db.TagTarget{Instances: []int64{hashed}}); err != nil || n != 0 {
 		t.Errorf("hashed: %d, %v", n, err)
 	}
+}
+
+// A v12 DB gains the directory print tables.
+func TestMigrateV12(t *testing.T) {
+	d := dbtest.New(t)
+	dbtest.AddFile(t, d, "/m/harbor.txt", "harbor")
+	if _, err := d.Exec(dbtest.PrintV12); err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	if err := d.Upgrade(&out); err != nil || !strings.Contains(out.String(), "schema v13") || strings.Contains(out.String(), "schema v12") {
+		t.Fatalf("Upgrade: %v, %q", err, out.String())
+	}
+	if err := d.RequireSchema(); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"dir_print", "dir_print_tag", "dir_print_entry"} {
+		if ok, err := dbHasTable(d, table); err != nil || !ok {
+			t.Errorf("%s: %v, %v", table, ok, err)
+		}
+	}
+}
+
+func dbHasTable(d *db.DB, name string) (bool, error) {
+	var n int
+	err := d.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?", name).Scan(&n)
+	return n > 0, err
 }

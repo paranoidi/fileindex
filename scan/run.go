@@ -42,7 +42,7 @@ type Reporter interface {
 	Scan(dir string, scanned, newFiles, skipped int) // discovery progress; dir "" = done
 	Hashed(res Stats)                                // last call: hashing done and committed, or skipped or cut short (res.Interrupted)
 	Prune(dir string, checked int)                   // pruning progress
-	Log(msg string)                                  // a removal made by pruning
+	Log(msg string)                                  // a removal made by pruning, or a directory tag restored
 }
 
 // FileReporter is an optional extension of Reporter: FileDone is called, from
@@ -97,7 +97,8 @@ type Stats struct {
 	TotalSize                                   int64
 	PrunedFiles, PrunedDirs                     int64
 	Errors                                      []string
-	Interrupted                                 bool // ctx was cancelled; the DB holds every committed batch and no half-applied one
+	Restored                                    []string // HashPaths only: directory tags restored by their files; Run logs them instead
+	Interrupted                                 bool     // ctx was cancelled; the DB holds every committed batch and no half-applied one
 }
 
 // ResolveRoots resolves scan arguments to real absolute paths that exist.
@@ -200,8 +201,34 @@ func Run(ctx context.Context, d *db.DB, args []string, opt Options, r Reporter) 
 			}
 		}
 	}
+	if !res.Interrupted {
+		if err := reattachDirTags(d, res, r.Log); err != nil {
+			return res, err
+		}
+	}
 	r.Hashed(res)
 	return res, nil
+}
+
+// reattachDirTags restores directory tags from prints (db.ReattachDirTags) and,
+// when the run indexed or hashed anything new, copies them from tagged dirs gone
+// from disk (db.ReattachLiveDirTags). Each restore is logged.
+func reattachDirTags(d *db.DB, res Stats, log func(string)) error {
+	lines, err := d.ReattachDirTags()
+	if err != nil {
+		return err
+	}
+	if res.Added > 0 || res.Processed > 0 {
+		live, err := d.ReattachLiveDirTags()
+		if err != nil {
+			return err
+		}
+		lines = append(lines, live...)
+	}
+	for _, l := range lines {
+		log(l)
+	}
+	return nil
 }
 
 // pruneRoots prunes the records under each root that are gone from disk, then
@@ -448,10 +475,14 @@ func hashPending(ctx context.Context, d *db.DB, opt Options, maxFiles int, scope
 }
 
 // HashPaths fully hashes the given indexed files and records them. Per-file
-// problems and a cancel land in the returned Stats, as in Run.
+// problems and a cancel land in the returned Stats, as in Run, and so do the
+// directory tags the new hashes restored.
 func HashPaths(ctx context.Context, d *db.DB, paths []string, workers int, onStart func(int, string), onTick func(int, float64), onDone func()) (Stats, error) {
 	var res Stats
 	err := hashPaths(ctx, d, Options{Workers: workers}, batchFiles, slices.Values(paths), onStart, onTick, onDone, nil, &res)
+	if err == nil && !res.Interrupted {
+		err = reattachDirTags(d, res, func(l string) { res.Restored = append(res.Restored, l) })
+	}
 	return res, err
 }
 

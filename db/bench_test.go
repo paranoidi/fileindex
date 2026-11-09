@@ -296,3 +296,53 @@ func BenchmarkRescanAll(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkReattachDirTags matches 500 prints of removed tagged dirs (100 files
+// each) against an index of 100k files where every one of them sits at a new path.
+func BenchmarkReattachDirTags(b *testing.B) {
+	const dirs, perDir, tagged = 1000, 100, 500
+	for b.Loop() {
+		b.StopTimer()
+		d := dbtest.New(b)
+		file := func(dir string, i int) db.ScannedFile {
+			h := sha256.Sum256(fmt.Append(nil, i))
+			s := hex.EncodeToString(h[:])
+			return db.ScannedFile{Dir: dir, Name: fmt.Sprintf("%s_%d.mkv", benchWords[i%len(benchWords)], i), Size: int64(1<<20 + i),
+				Mtime: time.Unix(1700000000, 0), MD5: s[:32], SHA256: s, Sample: s}
+		}
+		commit := func(prefix string, from int) {
+			var batch []db.ScannedFile
+			for dir := from; dir < dirs; dir++ {
+				for f := range perDir {
+					batch = append(batch, file(fmt.Sprintf("%s/d%d", prefix, dir), dir*perDir+f))
+				}
+			}
+			if _, err := d.CommitScanBatch(batch); err != nil {
+				b.Fatal(err)
+			}
+		}
+		commit("/old", 0)
+		var ids []int64
+		for dir := range tagged {
+			id, _, err := db.DirByPath(d, fmt.Sprintf("/old/d%d", dir))
+			if err != nil {
+				b.Fatal(err)
+			}
+			ids = append(ids, *id)
+		}
+		if _, err := d.AddTags(db.TagTarget{Dirs: ids}, []string{"watched"}); err != nil {
+			b.Fatal(err)
+		}
+		for dir := range tagged {
+			if _, err := d.RemoveTree(fmt.Sprintf("/old/d%d", dir)); err != nil {
+				b.Fatal(err)
+			}
+		}
+		commit("/new", 0) // the removed dirs' files at new paths, beside copies of the rest
+		b.StartTimer()
+		lines, err := d.ReattachDirTags()
+		if err != nil || len(lines) != tagged {
+			b.Fatal(len(lines), err)
+		}
+	}
+}

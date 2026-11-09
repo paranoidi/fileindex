@@ -16,4 +16,4 @@ An Instance with no content yet holds a **Pending tag** until its hash lands, be
 - An edited file inherits its old content's tags, and the old content keeps them too, until `tag-gc` or until a copy of it returns. Otherwise saving a tagged document would drop its tag.
 - A file moved and edited before any scan loses its tag: nothing links the two.
 - Empty files can't be tagged, since every empty file is the same content.
-- Dir tags still belong to the Dir record and are lost when a dir moves on disk.
+- Dir tags still belong to the Dir record and are lost when a dir moves on disk (ADR 0003 keeps them by a print of the dir's files).

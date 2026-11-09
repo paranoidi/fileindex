@@ -32,9 +32,19 @@ func Init(t testing.TB, p string) *db.DB {
 	return d
 }
 
-// SampleV11 turns a current schema back into v11: no sample tags, and the sample
-// hash columns under their first-8-KB name. Start of a v11 migration fixture.
-const SampleV11 = `DROP TABLE sample_tag;
+// PrintV12 turns a current schema back into v12: no directory prints. Start of
+// a v12 migration fixture.
+const PrintV12 = `DROP TABLE dir_print_entry;
+DROP TABLE dir_print_tag;
+DROP TABLE dir_print;
+DELETE FROM schema_version;
+INSERT INTO schema_version (version) VALUES (12);
+`
+
+// SampleV11 turns a current schema back into v11 (PrintV12, then no sample tags,
+// and the sample hash columns under their first-8-KB name). Start of a v11
+// migration fixture.
+const SampleV11 = PrintV12 + `DROP TABLE sample_tag;
 DROP INDEX idx_file_sha256_sample;
 ALTER TABLE file RENAME COLUMN sha256_sample TO sha256_8kb;
 ALTER TABLE instance RENAME COLUMN sha256_sample TO sha256_8kb;

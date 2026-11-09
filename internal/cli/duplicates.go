@@ -168,6 +168,9 @@ func (a *app) hashPotential(d *db.DB, groups []db.DupGroup) error {
 	if st.Interrupted {
 		return exitCode(130)
 	}
+	for _, l := range st.Restored {
+		fmt.Fprintln(a.stdout, l)
+	}
 	a.printErrors(st.Errors)
 	return nil
 }

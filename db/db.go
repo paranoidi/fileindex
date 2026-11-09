@@ -1,4 +1,4 @@
-// Package db holds the schema v12 SQLite index and every query on it.
+// Package db holds the schema v13 SQLite index and every query on it.
 //
 // Read TIMESTAMP columns (mtime, created_at, last_seen) as CAST(col AS TEXT):
 // the driver otherwise parses them into time.Time and reformats them.
@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const SchemaVersion = 12
+const SchemaVersion = 13
 
 // Querier is satisfied by *sql.DB and *sql.Tx, so helpers can run inside a caller's transaction.
 type Querier interface {
@@ -101,7 +101,7 @@ CREATE INDEX idx_file_sha256_noexif_jpeg ON file(sha256_noexif_jpeg);
 CREATE INDEX idx_file_sha256_sample ON file(sha256_sample);
 CREATE INDEX idx_file_size ON file(filesize);
 CREATE INDEX idx_dir_tag_dir_id ON dir_tag(dir_id);
-` + instanceIndexes + sampleTagSchema + ftsSchema + `INSERT INTO schema_version (version) VALUES (12);
+` + instanceIndexes + sampleTagSchema + dirPrintSchema + ftsSchema + `INSERT INTO schema_version (version) VALUES (13);
 `
 
 // contentTagSchema holds file tags. A content tag is keyed by sha256, not file.id:
@@ -138,6 +138,31 @@ const sampleTagSchema = `CREATE TABLE sample_tag (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     kept_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (size, sha256_sample, tag_id)
+) WITHOUT ROWID;
+`
+
+// dirPrintSchema holds the prints of deleted tagged Dirs: their tags, totals over
+// the subtree, and their printFiles largest files with path under the Dir, size
+// and hashes, until ReattachDirTags finds the Dir again or TagGC ends them.
+const dirPrintSchema = `CREATE TABLE dir_print (
+    id INTEGER PRIMARY KEY,
+    files INTEGER NOT NULL,
+    bytes INTEGER NOT NULL,
+    kept_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE dir_print_tag (
+    print_id INTEGER NOT NULL REFERENCES dir_print(id) ON DELETE CASCADE,
+    tag_id INTEGER NOT NULL REFERENCES tag(id) ON DELETE CASCADE,
+    created_at TIMESTAMP,
+    PRIMARY KEY (print_id, tag_id)
+) WITHOUT ROWID;
+CREATE TABLE dir_print_entry (
+    print_id INTEGER NOT NULL REFERENCES dir_print(id) ON DELETE CASCADE,
+    rel TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    sha256 TEXT,
+    sha256_sample TEXT,
+    PRIMARY KEY (print_id, rel)
 ) WITHOUT ROWID;
 `
 
@@ -384,7 +409,7 @@ func (d *DB) Init() error {
 	return d.RequireSchema()
 }
 
-// Upgrade migrates a v6 to v11 DB to the current schema, announced on w
+// Upgrade migrates a v6 to v12 DB to the current schema, announced on w
 // since rebuilding the FTS indexes takes minutes on millions of instances. A DB
 // already current is left alone.
 func (d *DB) Upgrade(w io.Writer) error {
@@ -409,12 +434,15 @@ func (d *DB) Upgrade(w io.Writer) error {
 			return err
 		}
 	}
-	fmt.Fprintln(w, "Migrating database to schema v12 (sample hashes replace first-8-KB hashes)...")
-	if err := d.migrateV11(); err != nil {
-		return err
+	if v.Int64 < 12 {
+		fmt.Fprintln(w, "Migrating database to schema v12 (sample hashes replace first-8-KB hashes)...")
+		if err := d.migrateV11(); err != nil {
+			return err
+		}
+		fmt.Fprintln(w, "Fast hashes were cleared: `scan --fast` or a full scan hashes those files again.")
 	}
-	fmt.Fprintln(w, "Fast hashes were cleared: `scan --fast` or a full scan hashes those files again.")
-	return nil
+	fmt.Fprintln(w, "Migrating database to schema v13 (directory tags kept by their files)...")
+	return d.execTx(dirPrintSchema + "INSERT INTO schema_version (version) VALUES (13);")
 }
 
 // upgradeToV10 runs the migrations up to v10 from a v6, v7, v8 or v9 DB.

@@ -28,6 +28,10 @@ A Tag held by an unhashed Instance until its hash lands, when it moves to the co
 **Sample tag**:
 A Pending tag whose fast-hashed Instance was deleted, kept by size and Sample until a File or fast-hashed Instance with the same pair takes it back.
 
+**Dir print**:
+What a deleted, tagged Dir leaves behind: its tags, totals over its subtree and its 64 largest files with path, size and hashes. A Dir at another path whose files match it takes the tags back.
+_Avoid_: fingerprint, snapshot
+
 **Duplicate**:
 A File that has more than one Instance.
 

@@ -778,7 +778,7 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 					return files, dirs, err
 				}
 			}
-			f, n, err := deleteTree(tx, s.id)
+			f, n, err := deleteTree(tx, s.id, s.path, log)
 			if err != nil {
 				return files, dirs, err
 			}
@@ -924,6 +924,14 @@ func (d *DB) PrunePath(ctx context.Context, path string, onDir func(dir string, 
 	if _, err := d.DeleteOrphanedFiles(); err != nil {
 		return p, err
 	}
+	// a pruned tagged dir may already be indexed at its new path
+	lines, err := d.ReattachDirTags()
+	if err != nil {
+		return p, err
+	}
+	for _, l := range lines {
+		log(l)
+	}
 	return p, ctx.Err()
 }
 
@@ -962,7 +970,7 @@ CROSS JOIN instance i ON i.dir_id = t.id WHERE i.file_id IS NOT NULL`, *id)
 	if err != nil {
 		return r, err
 	}
-	if r.Instances, r.Dirs, err = deleteTree(tx, *id); err != nil {
+	if r.Instances, r.Dirs, err = deleteTree(tx, *id, path, nil); err != nil {
 		return r, err
 	}
 	for parent.Valid {
