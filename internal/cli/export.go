@@ -117,7 +117,7 @@ func readImportCSV(path string) (rows []db.ImportRow, errs []string, err error) 
 		}
 		n := i + 2
 		row := db.ImportRow{
-			MD5: get("md5"), SHA256: get("sha256"), NoExifJPEG: get("sha256_noexif_jpeg"), SHA256_8KB: get("sha256_8kb"),
+			MD5: get("md5"), SHA256: get("sha256"), NoExifJPEG: get("sha256_noexif_jpeg"), Sample: get("sha256_sample"),
 			FileCreated: get("file_created_at"), FileLastSeen: get("file_last_seen"),
 			Path: get("path"), Filename: get("filename"), Mtime: get("mtime"),
 			InstCreated: get("instance_created_at"), InstLastSeen: get("instance_last_seen"),

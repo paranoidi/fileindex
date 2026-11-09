@@ -1,4 +1,4 @@
-// Package db holds the schema v11 SQLite index and every query on it.
+// Package db holds the schema v12 SQLite index and every query on it.
 //
 // Read TIMESTAMP columns (mtime, created_at, last_seen) as CAST(col AS TEXT):
 // the driver otherwise parses them into time.Time and reformats them.
@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const SchemaVersion = 11
+const SchemaVersion = 12
 
 // Querier is satisfied by *sql.DB and *sql.Tx, so helpers can run inside a caller's transaction.
 type Querier interface {
@@ -74,7 +74,7 @@ CREATE TABLE file (
     md5 TEXT NOT NULL,
     sha256 TEXT NOT NULL,
     sha256_noexif_jpeg TEXT,
-    sha256_8kb TEXT,
+    sha256_sample TEXT,
     filesize INTEGER NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -98,10 +98,10 @@ CREATE TABLE dir_tag (
 );
 CREATE INDEX idx_file_sha256 ON file(sha256);
 CREATE INDEX idx_file_sha256_noexif_jpeg ON file(sha256_noexif_jpeg);
-CREATE INDEX idx_file_sha256_8kb ON file(sha256_8kb);
+CREATE INDEX idx_file_sha256_sample ON file(sha256_sample);
 CREATE INDEX idx_file_size ON file(filesize);
 CREATE INDEX idx_dir_tag_dir_id ON dir_tag(dir_id);
-` + instanceIndexes + ftsSchema + `INSERT INTO schema_version (version) VALUES (11);
+` + instanceIndexes + sampleTagSchema + ftsSchema + `INSERT INTO schema_version (version) VALUES (12);
 `
 
 // contentTagSchema holds file tags. A content tag is keyed by sha256, not file.id:
@@ -127,10 +127,24 @@ CREATE TABLE pending_tag (
 );
 `
 
+// sampleTagSchema holds the pending tags of deleted instances that had a sample
+// hash, keyed by size and sample, until an instance or file with the same pair
+// takes them back (CommitScanBatch) or TagGC ends them: the file may have moved
+// before its full hash landed. kept_at is when its instance went.
+const sampleTagSchema = `CREATE TABLE sample_tag (
+    tag_id INTEGER NOT NULL REFERENCES tag(id) ON DELETE CASCADE,
+    size INTEGER NOT NULL,
+    sha256_sample TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    kept_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (size, sha256_sample, tag_id)
+) WITHOUT ROWID;
+`
+
 // instanceDDL is the instance table under the given name. file_id is NULL while
 // the file is not hashed yet (it is already listed and found by name); size is
 // the size seen at the last walk or hash, so listings never need the file row.
-// sha256_8kb is set on a fast-hashed instance, which has no file row to hold it.
+// sha256_sample is set on a fast-hashed instance, which has no file row to hold it.
 func instanceDDL(name string) string {
 	return `CREATE TABLE ` + name + ` (
     id INTEGER PRIMARY KEY,
@@ -140,7 +154,7 @@ func instanceDDL(name string) string {
     filename_lower TEXT NOT NULL,
     size INTEGER NOT NULL,
     mtime TIMESTAMP,
-    sha256_8kb TEXT,
+    sha256_sample TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (file_id) REFERENCES file(id) ON DELETE SET NULL,
@@ -153,9 +167,9 @@ func instanceDDL(name string) string {
 const instanceIndexes = `CREATE INDEX idx_instance_file_id ON instance(file_id);
 ` + fastIndex
 
-// fastIndex serves PotentialDuplicates. It is partial, so instances without a
-// fast hash cost nothing.
-const fastIndex = `CREATE INDEX idx_instance_fast ON instance(size, sha256_8kb) WHERE file_id IS NULL AND sha256_8kb IS NOT NULL;
+// fastIndex serves PotentialDuplicates and the sample tag lookups. It is
+// partial, so instances without a fast hash cost nothing.
+const fastIndex = `CREATE INDEX idx_instance_fast ON instance(size, sha256_sample) WHERE file_id IS NULL AND sha256_sample IS NOT NULL;
 `
 
 // ftsSchema adds two external-content FTS5 indexes over instance.filename, kept
@@ -193,7 +207,7 @@ INSERT INTO schema_version (version) VALUES (7);
 `
 
 // migrateV8 adds the fast hash column and its index.
-const migrateV8 = `ALTER TABLE instance ADD COLUMN sha256_8kb TEXT;
+const migrateV8 = `ALTER TABLE instance ADD COLUMN sha256_sample TEXT;
 ` + fastIndex + `INSERT INTO schema_version (version) VALUES (9);
 `
 
@@ -282,6 +296,36 @@ WHERE NOT EXISTS (SELECT 1 FROM file_tag ft WHERE ft.tag_id = ct.tag_id AND ft.i
 	return nil
 }
 
+// migrateV11 replaces the first-8-KB hash with the sample hash: the column is
+// renamed where it still has its old name, and every stored value is cleared, as
+// none of them is a sample. Fast-hashed instances become plain unhashed ones.
+func (d *DB) migrateV11() error {
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, table := range []string{"file", "instance"} {
+		var old bool
+		if err := tx.QueryRow("SELECT EXISTS (SELECT 1 FROM pragma_table_info(?) WHERE name = 'sha256_8kb')", table).Scan(&old); err != nil {
+			return err
+		}
+		if old {
+			if _, err := tx.Exec("ALTER TABLE " + table + " RENAME COLUMN sha256_8kb TO sha256_sample"); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.Exec(`DROP INDEX IF EXISTS idx_file_sha256_8kb;
+CREATE INDEX IF NOT EXISTS idx_file_sha256_sample ON file(sha256_sample);
+UPDATE file SET sha256_sample = NULL WHERE sha256_sample IS NOT NULL;
+UPDATE instance SET sha256_sample = NULL WHERE sha256_sample IS NOT NULL;
+` + sampleTagSchema + `INSERT INTO schema_version (version) VALUES (12);`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // migrateV7 rebuilds instance for the current schema, going straight to v9 since
 // instanceDDL already has v9's column (SQLite cannot drop NOT NULL in
 // place): file_id becomes nullable and size is copied from the file row. Ids are
@@ -340,7 +384,7 @@ func (d *DB) Init() error {
 	return d.RequireSchema()
 }
 
-// Upgrade migrates a v6 to v10 DB to the current schema, announced on w
+// Upgrade migrates a v6 to v11 DB to the current schema, announced on w
 // since rebuilding the FTS indexes takes minutes on millions of instances. A DB
 // already current is left alone.
 func (d *DB) Upgrade(w io.Writer) error {
@@ -359,8 +403,18 @@ func (d *DB) Upgrade(w io.Writer) error {
 			return err
 		}
 	}
-	fmt.Fprintln(w, "Migrating database to schema v11 (tags follow content)...")
-	return d.migrateV10(w)
+	if v.Int64 < 11 {
+		fmt.Fprintln(w, "Migrating database to schema v11 (tags follow content)...")
+		if err := d.migrateV10(w); err != nil {
+			return err
+		}
+	}
+	fmt.Fprintln(w, "Migrating database to schema v12 (sample hashes replace first-8-KB hashes)...")
+	if err := d.migrateV11(); err != nil {
+		return err
+	}
+	fmt.Fprintln(w, "Fast hashes were cleared: `scan --fast` or a full scan hashes those files again.")
+	return nil
 }
 
 // upgradeToV10 runs the migrations up to v10 from a v6, v7, v8 or v9 DB.

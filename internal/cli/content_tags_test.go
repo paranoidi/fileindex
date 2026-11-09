@@ -217,7 +217,7 @@ func TestPendingTagOnUnhashedFile(t *testing.T) {
 func TestFastScanKeepsTagPending(t *testing.T) {
 	h, d, tree := scanHarness(t)
 	file := filepath.Join(tree, "big.bin")
-	writeFile(t, file, strings.Repeat("x", 20000))
+	writeFile(t, file, strings.Repeat("x", 30000))
 	h.mustRun("scan", "--no-hash", tree)
 	h.mustRun("tag", file, "amber")
 	h.mustRun("scan", "--fast", tree)

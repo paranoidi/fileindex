@@ -191,10 +191,10 @@ func TestScanBackfillsHashes(t *testing.T) {
 	h, d, tree := scanHarness(t)
 	writeFile(t, filepath.Join(tree, "a.jpg"), "\xff\xd8\xff\xda\x00\x02\xff\xd9")
 	h.mustRun("scan", tree)
-	d.Exec("UPDATE file SET sha256_8kb = NULL, sha256_noexif_jpeg = NULL")
+	d.Exec("UPDATE file SET sha256_sample = NULL, sha256_noexif_jpeg = NULL")
 	h.mustRun("scan", "-a", tree)
 	var n int
-	d.QueryRow("SELECT COUNT(*) FROM file WHERE sha256_8kb IS NOT NULL AND sha256_noexif_jpeg IS NOT NULL").Scan(&n)
+	d.QueryRow("SELECT COUNT(*) FROM file WHERE sha256_sample IS NOT NULL AND sha256_noexif_jpeg IS NOT NULL").Scan(&n)
 	if n != 1 {
 		t.Error("hashes not backfilled")
 	}
@@ -318,12 +318,12 @@ func TestScanErrorsListed(t *testing.T) {
 
 func TestScanFastThenDuplicates(t *testing.T) {
 	h, d, tree := scanHarness(t)
-	big := strings.Repeat("x", 9000)
+	big := strings.Repeat("x", 30000)
 	a, b, c := filepath.Join(tree, "a"), filepath.Join(tree, "b"), filepath.Join(tree, "c")
 	longer := filepath.Join(tree, "longer")
 	writeFile(t, a, big)
 	writeFile(t, b, big)
-	writeFile(t, c, big[:8999]+"y") // same size and head, other tail
+	writeFile(t, c, big[:10000]+"y"+big[10001:]) // same size and sample, differs between head and middle
 	writeFile(t, longer, big+"x")
 	writeFile(t, filepath.Join(tree, "small1"), "tiny") // read whole, so confirmed at once
 	writeFile(t, filepath.Join(tree, "small2"), "tiny")
@@ -343,8 +343,8 @@ func TestScanFastThenDuplicates(t *testing.T) {
 	out = h.mustRun("duplicates")
 	wantLines(t, out,
 		"Found 1 sets of duplicate files:",
-		"Found 1 sets of potential duplicates (same size and first 8 KB, not fully hashed):",
-		"1. File size: 8.79 KiB (3 instances)",
+		"Found 1 sets of potential duplicates (same size and sample, not fully hashed):",
+		"1. File size: 29.30 KiB (3 instances)",
 		"     "+c,
 		"4 files not fully hashed (4 fast-hashed, 0 unhashed). Confirm potential duplicates with --full-hash-potential, or hash everything with `fileindex scan`.",
 	)
@@ -393,7 +393,7 @@ func TestDuplicatesReportsUnhashed(t *testing.T) {
 
 func TestDuplicatesFullHashReportsErrors(t *testing.T) {
 	h, _, tree := scanHarness(t)
-	big := strings.Repeat("x", 9000)
+	big := strings.Repeat("x", 30000)
 	a, b := filepath.Join(tree, "a"), filepath.Join(tree, "b")
 	writeFile(t, a, big)
 	writeFile(t, b, big)

@@ -101,7 +101,7 @@ func TestFindOutdatedSchema(t *testing.T) {
 	if _, err := d.Exec("INSERT INTO schema_version (version) VALUES (6)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.Exec("DELETE FROM schema_version WHERE version = 11"); err != nil {
+	if _, err := d.Exec("DELETE FROM schema_version WHERE version = 12"); err != nil {
 		t.Fatal(err)
 	}
 	if code, _, errOut := h.run("find", "*", "/m"); code != 1 || !strings.Contains(errOut, "run `fileindex upgrade-db`") {
@@ -203,7 +203,7 @@ func TestMatchSingleFile(t *testing.T) {
 	}
 
 	// --fast uses the first-8KiB hash
-	if out := h.mustRun("match", filepath.Join(tree, "a.jpg"), "-f"); !strings.Contains(out, "Hash (SHA256 (8KB)): ") {
+	if out := h.mustRun("match", filepath.Join(tree, "a.jpg"), "-f"); !strings.Contains(out, "Hash (SHA256 (sample)): ") {
 		t.Errorf("--fast: %q", out)
 	}
 }

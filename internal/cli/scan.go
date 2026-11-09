@@ -34,7 +34,7 @@ func scanCmd(a *app) *cobra.Command {
 	}
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Suppress progress output")
 	cmd.Flags().BoolVar(&noHash, "no-hash", false, "Only index names, sizes and mtimes; files stay unhashed (searchable by name) until a later scan hashes them")
-	cmd.Flags().BoolVarP(&fast, "fast", "f", false, "Hash only the first 8 KB of larger files; a later scan without --fast hashes them fully. duplicates reports them as potential, and misses re-tagged JPEGs until then")
+	cmd.Flags().BoolVarP(&fast, "fast", "f", false, "Hash only a sample (first, middle and last 8 KB) of larger files; a later scan without --fast hashes them fully. duplicates reports them as potential, and misses re-tagged JPEGs until then")
 	cmd.Flags().BoolVarP(&all, "all", "a", false, "Re-hash every file, including ones already indexed with the same size and mtime")
 	return cmd
 }

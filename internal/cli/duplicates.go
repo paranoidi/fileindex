@@ -93,7 +93,7 @@ func duplicatesCmd(a *app) *cobra.Command {
 				if len(groups) > 0 {
 					fmt.Fprintln(w)
 				}
-				fmt.Fprintf(w, "Found %d sets of potential duplicates (same size and first 8 KB, not fully hashed):\n\n", len(potential))
+				fmt.Fprintf(w, "Found %d sets of potential duplicates (same size and sample, not fully hashed):\n\n", len(potential))
 				fmt.Fprintf(w, "Potential wasted space: up to %s\n", db.FormatSize(printGroups(w, potential)))
 			}
 			if fast+none > 0 {

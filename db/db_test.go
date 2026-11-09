@@ -107,8 +107,8 @@ func TestInitSchema(t *testing.T) {
 	d := dbtest.New(t)
 	var n int
 	d.QueryRow("SELECT COUNT(*) FROM sqlite_master").Scan(&n)
-	if n != 33 { // 8 tables + 7 indexes + 6 autoindexes + 2 FTS tables, their 7 shadow tables, 3 triggers
-		t.Errorf("sqlite_master rows = %d, want 33", n)
+	if n != 34 { // 9 tables + 7 indexes + 6 autoindexes + 2 FTS tables, their 7 shadow tables, 3 triggers
+		t.Errorf("sqlite_master rows = %d, want 34", n)
 	}
 	var mode string
 	d.QueryRow("PRAGMA journal_mode").Scan(&mode)
@@ -555,7 +555,7 @@ func TestCommitScanBatch(t *testing.T) {
 	d := dbtest.New(t)
 	f := func(dir, name, hash string) db.ScannedFile {
 		return db.ScannedFile{Dir: dir, Name: name, Size: 1, Mtime: time.Unix(1700000000, 0),
-			MD5: hash[:4], SHA256: hash, SHA256_8KB: hash}
+			MD5: hash[:4], SHA256: hash, Sample: hash}
 	}
 	res, err := d.CommitScanBatch([]db.ScannedFile{
 		f("/m", "holiday_beach.jpg", "aaaa1"), f("/m/sub", "snow day.png", "bbbb1"), f("/m", "holiday_beach.jpg", "cccc1"),
@@ -731,7 +731,7 @@ func addFast(t *testing.T, d *db.DB, dir, name string, size int64, head string) 
 	if _, err := d.CommitDiscovered([]db.DiscoveredFile{{Dir: dir, Name: name, Size: size, Mtime: mtime}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.CommitScanBatch([]db.ScannedFile{{Dir: dir, Name: name, Size: size, Mtime: mtime, SHA256_8KB: head}}); err != nil {
+	if _, err := d.CommitScanBatch([]db.ScannedFile{{Dir: dir, Name: name, Size: size, Mtime: mtime, Sample: head}}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -782,7 +782,7 @@ func TestFastHashLifecycle(t *testing.T) {
 	}
 	// a full hash replaces it, and a late fast hash can't come back beside it
 	addFast(t, d, "/m", "a", 9000, "h")
-	full := db.ScannedFile{Dir: "/m", Name: "a", Size: 9000, Mtime: time.Unix(1700000000, 0), MD5: "m", SHA256: "s", SHA256_8KB: "h"}
+	full := db.ScannedFile{Dir: "/m", Name: "a", Size: 9000, Mtime: time.Unix(1700000000, 0), MD5: "m", SHA256: "s", Sample: "h"}
 	if _, err := d.CommitScanBatch([]db.ScannedFile{full}); err != nil {
 		t.Fatal(err)
 	}
@@ -800,9 +800,9 @@ func TestPotentialDuplicates(t *testing.T) {
 	if groups, err := d.PotentialDuplicates(nil, false); err != nil || len(groups) != 0 {
 		t.Fatalf("empty: %+v, %v", groups, err)
 	}
-	head := func(content string) string { // what dbtest.AddFile stores in file.sha256_8kb
+	head := func(content string) string { // what dbtest.AddFile stores in file.sha256_sample
 		var h string
-		if err := d.QueryRow("SELECT sha256_8kb FROM file WHERE filesize = ?", len(content)).Scan(&h); err != nil {
+		if err := d.QueryRow("SELECT sha256_sample FROM file WHERE filesize = ?", len(content)).Scan(&h); err != nil {
 			t.Fatal(err)
 		}
 		return h
@@ -858,7 +858,7 @@ func TestDuplicatesContentKeys(t *testing.T) {
 	mtime := time.Unix(1700000000, 0)
 	add := func(name, sha string, noexif *string) {
 		t.Helper()
-		f := db.ScannedFile{Dir: "/m", Name: name, Size: 10, Mtime: mtime, MD5: "md5" + sha, SHA256: sha, SHA256_8KB: "h", NoExifJPEG: noexif}
+		f := db.ScannedFile{Dir: "/m", Name: name, Size: 10, Mtime: mtime, MD5: "md5" + sha, SHA256: sha, Sample: "h", NoExifJPEG: noexif}
 		if res, err := d.CommitScanBatch([]db.ScannedFile{f}); err != nil || len(res.Failed) > 0 {
 			t.Fatalf("%s: %+v, %v", name, res, err)
 		}
@@ -910,7 +910,7 @@ func TestDuplicatesMatchesContentGrouping(t *testing.T) {
 			sha = fmt.Sprintf("x%d", r.IntN(60))
 		}
 		batch = append(batch, db.ScannedFile{Dir: fmt.Sprintf("/m/d%d", i%7), Name: name, Size: int64(r.IntN(5) + 1), Mtime: mtime,
-			MD5: "md5" + sha, SHA256: sha, SHA256_8KB: "h", NoExifJPEG: noexif})
+			MD5: "md5" + sha, SHA256: sha, Sample: "h", NoExifJPEG: noexif})
 	}
 	if res, err := d.CommitScanBatch(batch); err != nil || len(res.Failed) > 0 {
 		t.Fatalf("%+v, %v", res, err)
@@ -1372,5 +1372,58 @@ func TestRemoveInstanceKeepsContentTag(t *testing.T) {
 	}
 	if err := d.QueryRow("SELECT COUNT(*) FROM content_tag WHERE gone_at IS NOT NULL").Scan(&gone); err != nil || gone != 0 {
 		t.Errorf("rows with gone_at after it came back = %d, %v", gone, err)
+	}
+}
+
+// A v11 DB's first-8-KB hashes are not samples: the columns take the sample name
+// and lose every value, and sample_tag appears.
+func TestMigrateV11(t *testing.T) {
+	d := dbtest.New(t)
+	dbtest.AddFile(t, d, "/m/harbor.txt", "harbor")
+	addFast(t, d, "/m", "meadow", 9000, "h")
+	if _, err := d.Exec(dbtest.SampleV11); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.RequireSchema(); err != db.ErrOutdatedSchema {
+		t.Fatalf("RequireSchema = %v", err)
+	}
+	var out strings.Builder
+	if err := d.Upgrade(&out); err != nil || !strings.Contains(out.String(), "schema v12") || strings.Contains(out.String(), "schema v11") {
+		t.Fatalf("Upgrade: %v, %q", err, out.String())
+	}
+	if err := d.RequireSchema(); err != nil {
+		t.Fatal(err)
+	}
+	var left int
+	if err := d.QueryRow(`SELECT (SELECT COUNT(sha256_sample) FROM file) + (SELECT COUNT(sha256_sample) FROM instance)
++ (SELECT COUNT(*) FROM sample_tag)`).Scan(&left); err != nil || left != 0 {
+		t.Errorf("samples left = %d, %v", left, err)
+	}
+	fresh := dbtest.New(t)
+	if got, want := indexNames(t, d), indexNames(t, fresh); !slices.Equal(got, want) {
+		t.Errorf("indexes = %v, want %v", got, want)
+	}
+}
+
+func TestUnsampledInstances(t *testing.T) {
+	d := dbtest.New(t)
+	hashed := dbtest.AddFile(t, d, "/m/harbor.txt", "harbor")
+	addFast(t, d, "/m", "sampled", 30000, "h")
+	if _, err := d.CommitDiscovered([]db.DiscoveredFile{
+		{Dir: "/m", Name: "bare", Size: 30000, Mtime: time.Unix(1700000000, 0)},
+		{Dir: "/m", Name: "empty", Size: 0, Mtime: time.Unix(1700000000, 0)},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	dir, _, _ := db.DirByPath(d, "/m")
+	target, err := d.TreeTarget(*dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := d.UnsampledInstances(target); err != nil || n != 1 {
+		t.Errorf("UnsampledInstances = %d, %v; want only bare", n, err)
+	}
+	if n, err := d.UnsampledInstances(db.TagTarget{Instances: []int64{hashed}}); err != nil || n != 0 {
+		t.Errorf("hashed: %d, %v", n, err)
 	}
 }

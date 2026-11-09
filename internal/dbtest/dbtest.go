@@ -32,9 +32,20 @@ func Init(t testing.TB, p string) *db.DB {
 	return d
 }
 
-// FileTagsV10 turns a current schema's file tags back into v10's file_tag, as the
-// start of building a fixture for a migration.
-const FileTagsV10 = `DROP TABLE content_tag;
+// SampleV11 turns a current schema back into v11: no sample tags, and the sample
+// hash columns under their first-8-KB name. Start of a v11 migration fixture.
+const SampleV11 = `DROP TABLE sample_tag;
+DROP INDEX idx_file_sha256_sample;
+ALTER TABLE file RENAME COLUMN sha256_sample TO sha256_8kb;
+ALTER TABLE instance RENAME COLUMN sha256_sample TO sha256_8kb;
+CREATE INDEX idx_file_sha256_8kb ON file(sha256_8kb);
+DELETE FROM schema_version;
+INSERT INTO schema_version (version) VALUES (11);
+`
+
+// FileTagsV10 turns a current schema back into v11 (SampleV11) and its file tags
+// into v10's file_tag, as the start of building a fixture for a migration.
+const FileTagsV10 = SampleV11 + `DROP TABLE content_tag;
 DROP TABLE pending_tag;
 CREATE TABLE file_tag (
     tag_id INTEGER NOT NULL,
@@ -50,7 +61,7 @@ CREATE INDEX idx_file_tag_instance_id ON file_tag(instance_id);`
 const Mtime = "2024-01-02 03:04:05"
 
 // AddFile records content as an instance at the absolute path p, creating the dirs
-// and the file row (md5, sha256, sha256_8kb of content; no noexif hash) as needed.
+// and the file row (md5, sha256, sha256_sample of content; no noexif hash) as needed.
 // Returns the instance id.
 func AddFile(t testing.TB, d *db.DB, p, content string) int64 {
 	t.Helper()
@@ -66,7 +77,7 @@ func AddFile(t testing.TB, d *db.DB, p, content string) int64 {
 	var fileID int64
 	err = d.QueryRow("SELECT id FROM file WHERE sha256 = ?", hex.EncodeToString(s[:])).Scan(&fileID)
 	if err != nil {
-		res, err := d.Exec("INSERT INTO file (md5, sha256, sha256_8kb, filesize) VALUES (?, ?, ?, ?)",
+		res, err := d.Exec("INSERT INTO file (md5, sha256, sha256_sample, filesize) VALUES (?, ?, ?, ?)",
 			hex.EncodeToString(m[:]), hex.EncodeToString(s[:]), hex.EncodeToString(s8[:]), len(content))
 		if err != nil {
 			t.Fatal(err)

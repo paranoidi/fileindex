@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"iter"
 	"os"
@@ -17,9 +18,10 @@ import (
 )
 
 // Hashes are lowercase hex. NoExifJPEG is set only for .jpg/.jpeg files that strip cleanly.
+// Sample is the sample hash (sampleRanges).
 type Hashes struct {
-	MD5, SHA256, SHA256_8KB string
-	NoExifJPEG              *string
+	MD5, SHA256, Sample string
+	NoExifJPEG          *string
 }
 
 // Result is one hashed file. Size and Mtime come from the stat taken before
@@ -40,11 +42,26 @@ var afterHash = func(string) {}
 // hashes.
 func HashFile(path string) Result { return hashFile(path, new(atomic.Int64), false) }
 
-// headSize is how much of a file sha256_8kb covers.
-const headSize = 8192
+// sampleSize is the length of each piece of a file the sample hash covers.
+const sampleSize = 8192
+
+// sampleRanges are the [start, end) byte ranges the sample hash covers in a file
+// of size: its first, middle and last sampleSize bytes, or the whole file when
+// those would touch. The tail catches a file cut short or still being written
+// into a preallocated full size; the middle, a gap left in between.
+func sampleRanges(size int64) [][2]int64 {
+	if size <= 3*sampleSize {
+		return [][2]int64{{0, size}}
+	}
+	mid := size/2 - sampleSize/2
+	return [][2]int64{{0, sampleSize}, {mid, mid + sampleSize}, {size - sampleSize, size}}
+}
+
+// sampleRead is how many bytes a sample-only hash reads from a file of size.
+func sampleRead(size int64) int64 { return min(size, 3*sampleSize) }
 
 // hashFile is HashFile that adds bytes to read as they are read. With fast, a
-// file larger than headSize gets only Hashes.SHA256_8KB; a smaller one is read
+// file larger than its sample gets only Hashes.Sample; a smaller one is read
 // whole anyway, so it gets every hash.
 func hashFile(path string, read *atomic.Int64, fast bool) Result {
 	r := Result{Path: path}
@@ -63,10 +80,10 @@ func hashFile(path string, read *atomic.Int64, fast bool) Result {
 	r.Size, r.Mtime = before.Size(), before.ModTime()
 
 	hash := hashContent
-	if fast && before.Size() > headSize {
-		hash = hashHead
+	if fast && sampleRead(before.Size()) < before.Size() {
+		hash = hashSample
 	}
-	if r.Hashes, err = hash(path, read); err != nil {
+	if r.Hashes, err = hash(path, before.Size(), read); err != nil {
 		if pe, ok := err.(*os.PathError); ok {
 			err = pe.Err // the path is already in the message
 		}
@@ -92,30 +109,51 @@ func (c countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// readHead reads up to headSize bytes; a shorter file is not an error.
-func readHead(r io.Reader) ([]byte, error) {
-	head := make([]byte, headSize)
-	n, err := io.ReadFull(r, head)
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		return nil, err
-	}
-	return head[:n], nil
+// sampler is a writer that hashes the sampleRanges bytes of the stream written
+// to it, which must start at offset 0.
+type sampler struct {
+	h      hash.Hash
+	ranges [][2]int64
+	off    int64
 }
 
-func hashHead(path string, read *atomic.Int64) (Hashes, error) {
+func newSampler(size int64) *sampler { return &sampler{h: sha256.New(), ranges: sampleRanges(size)} }
+
+func (s *sampler) Write(p []byte) (int, error) {
+	start, end := s.off, s.off+int64(len(p))
+	for _, r := range s.ranges {
+		if lo, hi := max(r[0], start), min(r[1], end); lo < hi {
+			_, _ = s.h.Write(p[lo-start : hi-start]) // hash writers never fail
+		}
+	}
+	s.off = end
+	return len(p), nil
+}
+
+func (s *sampler) sum() string { return hex.EncodeToString(s.h.Sum(nil)) }
+
+// hashSample reads only the sampleRanges of a file of size.
+func hashSample(path string, size int64, read *atomic.Int64) (Hashes, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return Hashes{}, err
 	}
 	defer file.Close()
-	head, err := readHead(countingReader{file, read})
-	if err != nil {
-		return Hashes{}, err
+	s := newSampler(size)
+	for _, r := range s.ranges {
+		buf := make([]byte, r[1]-r[0])
+		if _, err := io.ReadFull(countingReader{io.NewSectionReader(file, r[0], r[1]-r[0]), read}, buf); err != nil {
+			return Hashes{}, err
+		}
+		s.off = r[0]
+		_, _ = s.Write(buf)
 	}
-	return Hashes{SHA256_8KB: sha256Hex(head)}, nil
+	return Hashes{Sample: s.sum()}, nil
 }
 
-func hashContent(path string, read *atomic.Int64) (Hashes, error) {
+// hashContent reads the whole file, size bytes at the stat before hashing, for
+// every hash.
+func hashContent(path string, size int64, read *atomic.Int64) (Hashes, error) {
 	var h Hashes
 	file, err := os.Open(path)
 	if err != nil {
@@ -123,6 +161,7 @@ func hashContent(path string, read *atomic.Int64) (Hashes, error) {
 	}
 	defer file.Close()
 	f := countingReader{file, read}
+	smp := newSampler(size)
 
 	ext := strings.ToLower(filepath.Ext(path))
 	if ext == ".jpg" || ext == ".jpeg" {
@@ -130,7 +169,8 @@ func hashContent(path string, read *atomic.Int64) (Hashes, error) {
 		if err != nil {
 			return h, err
 		}
-		h.MD5, h.SHA256, h.SHA256_8KB = md5Hex(data), sha256Hex(data), sha256Hex(data[:min(len(data), headSize)])
+		_, _ = smp.Write(data)
+		h.MD5, h.SHA256, h.Sample = md5Hex(data), sha256Hex(data), smp.sum()
 		if stripped, err := StripJPEGMetadata(data); err == nil {
 			s := sha256Hex(stripped)
 			h.NoExifJPEG = &s
@@ -141,16 +181,10 @@ func hashContent(path string, read *atomic.Int64) (Hashes, error) {
 	}
 
 	m, s := md5.New(), sha256.New()
-	w := io.MultiWriter(m, s)
-	head, err := readHead(f)
-	if err != nil {
+	if _, err := io.Copy(io.MultiWriter(m, s, smp), f); err != nil {
 		return h, err
 	}
-	_, _ = w.Write(head) // hash writers never fail
-	if _, err := io.Copy(w, f); err != nil {
-		return h, err
-	}
-	h.MD5, h.SHA256, h.SHA256_8KB = hex.EncodeToString(m.Sum(nil)), hex.EncodeToString(s.Sum(nil)), sha256Hex(head)
+	h.MD5, h.SHA256, h.Sample = hex.EncodeToString(m.Sum(nil)), hex.EncodeToString(s.Sum(nil)), smp.sum()
 	return h, nil
 }
 

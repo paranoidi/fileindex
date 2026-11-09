@@ -63,7 +63,7 @@ func matchCmd(a *app) *cobra.Command {
 	f := cmd.Flags()
 	f.StringVar(&o.hash, "hash", "", "Explicit hash value to search for")
 	f.BoolVarP(&o.recursive, "recursive", "r", false, "Process directories recursively")
-	f.BoolVarP(&o.fast, "fast", "f", false, "Match on the hash of the first 8 KiB only")
+	f.BoolVarP(&o.fast, "fast", "f", false, "Match on the sample hash only (first, middle and last 8 KiB)")
 	f.BoolVar(&o.details, "details", false, "Show detailed information")
 	f.BoolVar(&o.short, "short", false, "Print only the number of matches")
 	f.IntVar(&o.abortDepth, "abort-depth", -1, "Abort with an error on a file deeper than this (implies -r)")
@@ -102,8 +102,8 @@ func (a *app) matchHash(d *db.DB, h string, o matchOpts) error {
 		if r.NoExifJPEG != "" {
 			fmt.Fprintf(w, "SHA256 (no EXIF): %s\n", r.NoExifJPEG)
 		}
-		if r.SHA256_8KB != "" {
-			fmt.Fprintf(w, "SHA256 (8KB): %s\n", r.SHA256_8KB)
+		if r.Sample != "" {
+			fmt.Fprintf(w, "SHA256 (sample): %s\n", r.Sample)
 		}
 		if r.Mtime != "" {
 			fmt.Fprintf(w, "Modified: %s\n", r.Mtime)
@@ -113,13 +113,13 @@ func (a *app) matchHash(d *db.DB, h string, o matchOpts) error {
 	return nil
 }
 
-// pickHash: --fast uses the first-8KiB hash; a JPEG with image data uses the
+// pickHash: --fast uses the sample hash; a JPEG with image data uses the
 // metadata-free hash, so copies with different EXIF match; else full sha256.
 func pickHash(path string, h scan.Hashes, fast bool) (label, value string) {
 	ext := strings.ToLower(filepath.Ext(path))
 	switch {
 	case fast:
-		return "SHA256 (8KB)", h.SHA256_8KB
+		return "SHA256 (sample)", h.Sample
 	case (ext == ".jpg" || ext == ".jpeg") && h.NoExifJPEG != nil:
 		return "SHA256 (no EXIF)", *h.NoExifJPEG
 	}

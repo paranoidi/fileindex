@@ -225,15 +225,15 @@ func hexOf(sum []byte) string { return hex.EncodeToString(sum) }
 
 func TestHashFile(t *testing.T) {
 	d := t.TempDir()
-	big := bytes.Repeat([]byte("0123456789"), 2000) // > 8 KiB
+	big := bytes.Repeat([]byte("0123456789"), 4000) // > 3 samples
 	p := filepath.Join(d, "big.bin")
 	write(t, p, string(big))
 	r := HashFile(p)
 	if r.Err != nil {
 		t.Fatal(r.Err)
 	}
-	m, s, s8 := md5.Sum(big), sha256.Sum256(big), sha256.Sum256(big[:8192])
-	if r.Hashes.MD5 != hexOf(m[:]) || r.Hashes.SHA256 != hexOf(s[:]) || r.Hashes.SHA256_8KB != hexOf(s8[:]) || r.Hashes.NoExifJPEG != nil {
+	m, s, s8 := md5.Sum(big), sha256.Sum256(big), sha256.Sum256(slices.Concat(big[:8192], big[len(big)/2-4096:len(big)/2+4096], big[len(big)-8192:]))
+	if r.Hashes.MD5 != hexOf(m[:]) || r.Hashes.SHA256 != hexOf(s[:]) || r.Hashes.Sample != hexOf(s8[:]) || r.Hashes.NoExifJPEG != nil {
 		t.Errorf("hashes: %+v", r.Hashes)
 	}
 	if r.Size != int64(len(big)) || r.Mtime.IsZero() {
@@ -383,21 +383,77 @@ func TestWalkWarningsDoNotReachDefaultLogger(t *testing.T) {
 
 func TestHashFileFast(t *testing.T) {
 	d := t.TempDir()
-	big := filepath.Join(d, "big.jpg")
-	os.WriteFile(big, bytes.Repeat([]byte("x"), headSize+1), 0o644)
-	var read atomic.Int64
-	r := hashFile(big, &read, true)
-	full := HashFile(big)
-	if r.Err != nil || r.Hashes.SHA256 != "" || r.Hashes.MD5 != "" || r.Hashes.NoExifJPEG != nil || r.Hashes.SHA256_8KB != full.Hashes.SHA256_8KB || r.Size != headSize+1 {
-		t.Errorf("fast = %+v, full = %+v", r, full)
+	const limit = 3 * sampleSize
+	for _, name := range []string{"big.jpg", "big.bin"} { // a JPEG is hashed from memory, others streamed
+		big := filepath.Join(d, name)
+		data := make([]byte, 5*sampleSize+123)
+		for i := range data {
+			data[i] = byte(i * 7)
+		}
+		os.WriteFile(big, data, 0o644)
+		var read atomic.Int64
+		r := hashFile(big, &read, true)
+		full := HashFile(big)
+		if r.Err != nil || r.Hashes.SHA256 != "" || r.Hashes.MD5 != "" || r.Hashes.NoExifJPEG != nil || r.Hashes.Sample == "" ||
+			r.Hashes.Sample != full.Hashes.Sample || r.Size != int64(len(data)) {
+			t.Errorf("%s: fast = %+v, full = %+v", name, r, full)
+		}
+		if read.Load() != limit {
+			t.Errorf("%s: read %d bytes", name, read.Load())
+		}
+		var want []byte
+		for _, rg := range sampleRanges(int64(len(data))) {
+			want = append(want, data[rg[0]:rg[1]]...)
+		}
+		if r.Hashes.Sample != sha256Hex(want) {
+			t.Errorf("%s: sample is not the hash of head, middle and tail", name)
+		}
 	}
-	if read.Load() != headSize {
-		t.Errorf("read %d bytes", read.Load())
-	}
-	// a file that fits in the head is read whole, so it gets every hash
+	// a file that fits in the sample is read whole, so it gets every hash
 	small := filepath.Join(d, "small")
-	os.WriteFile(small, bytes.Repeat([]byte("x"), headSize), 0o644)
-	if r := hashFile(small, new(atomic.Int64), true); r.Err != nil || r.Hashes != HashFile(small).Hashes {
+	os.WriteFile(small, bytes.Repeat([]byte("x"), limit), 0o644)
+	if r := hashFile(small, new(atomic.Int64), true); r.Err != nil || r.Hashes != HashFile(small).Hashes || r.Hashes.Sample != r.Hashes.SHA256 {
 		t.Errorf("small fast = %+v", r)
+	}
+}
+
+// The sample sees a change in the middle or at the end that the head misses: a
+// download in progress into a preallocated file.
+func TestSampleSeesMiddleAndTail(t *testing.T) {
+	d := t.TempDir()
+	base := bytes.Repeat([]byte("ab"), 50*sampleSize)
+	sample := func(data []byte) string {
+		p := filepath.Join(d, "f")
+		os.WriteFile(p, data, 0o644)
+		return hashFile(p, new(atomic.Int64), true).Hashes.Sample
+	}
+	orig := sample(base)
+	for _, at := range []int{len(base) / 2, len(base) - 1} {
+		changed := bytes.Clone(base)
+		changed[at] = 0
+		if sample(changed) == orig {
+			t.Errorf("a change at %d of %d is not in the sample", at, len(base))
+		}
+	}
+	changed := bytes.Clone(base)
+	changed[sampleSize+1] = 0 // between head and middle
+	if sample(changed) != orig {
+		t.Error("a byte outside the sampled ranges changed the sample")
+	}
+}
+
+func TestSampleRanges(t *testing.T) {
+	for _, size := range []int64{0, 1, 3 * sampleSize, 3*sampleSize + 1, 1 << 40} {
+		rs := sampleRanges(size)
+		var n, prev int64
+		for _, r := range rs {
+			if r[0] < prev || r[1] <= r[0] && size > 0 || r[1] > size {
+				t.Errorf("size %d: bad ranges %v", size, rs)
+			}
+			n, prev = n+r[1]-r[0], r[1]
+		}
+		if n != sampleRead(size) {
+			t.Errorf("size %d: ranges cover %d, sampleRead says %d", size, n, sampleRead(size))
+		}
 	}
 }

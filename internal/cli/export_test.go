@@ -9,7 +9,7 @@ import (
 	"github.com/paranoidi/fileindex/db"
 )
 
-const csvHeader = "md5,sha256,sha256_noexif_jpeg,sha256_8kb,filesize,file_created_at,file_last_seen,path,filename,mtime,instance_created_at,instance_last_seen\r\n"
+const csvHeader = "md5,sha256,sha256_noexif_jpeg,sha256_sample,filesize,file_created_at,file_last_seen,path,filename,mtime,instance_created_at,instance_last_seen\r\n"
 
 func rowSet(t *testing.T, d *db.DB) []string {
 	t.Helper()
@@ -92,7 +92,7 @@ func TestImportDefaults(t *testing.T) {
 	p := writeCSV(t, strings.TrimSuffix(csvHeader, "\r\n"), md5A+","+shaA+",,,5,,,/m,a.jpg,,,")
 	h.mustRun("import", p)
 	var n int
-	d.QueryRow("SELECT COUNT(*) FROM file f JOIN instance i ON i.file_id = f.id WHERE f.created_at IS NOT NULL AND f.last_seen IS NOT NULL AND i.created_at IS NOT NULL AND i.last_seen IS NOT NULL AND i.mtime IS NULL AND f.sha256_8kb IS NULL").Scan(&n)
+	d.QueryRow("SELECT COUNT(*) FROM file f JOIN instance i ON i.file_id = f.id WHERE f.created_at IS NOT NULL AND f.last_seen IS NOT NULL AND i.created_at IS NOT NULL AND i.last_seen IS NOT NULL AND i.mtime IS NULL AND f.sha256_sample IS NULL").Scan(&n)
 	if n != 1 {
 		t.Error("defaults not applied, or empty fields not NULL")
 	}

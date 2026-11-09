@@ -101,7 +101,7 @@ WHERE f.filesize > 0`, filter, within)
 }
 
 // PotentialDuplicates returns the sets of 2+ instances with the same size and
-// first 8 KB where at least one is only fast-hashed, biggest first; filter and
+// sample hash where at least one is only fast-hashed, biggest first; filter and
 // within work as in Duplicates. A set with no fast-hashed member is left out:
 // its full hashes already say whether it is a duplicate.
 func (d *DB) PotentialDuplicates(filter []int64, within bool) ([]DupGroup, error) {
@@ -110,14 +110,14 @@ func (d *DB) PotentialDuplicates(filter []int64, within bool) ([]DupGroup, error
 	// the size of the index. INDEXED BY because the planner otherwise picks
 	// idx_instance_file_id and reads every unhashed row, 700x slower on 500k of them.
 	return d.dupGroups(`WITH fast AS (
-    SELECT size, sha256_8kb AS head, dir_id, filename
-    FROM instance INDEXED BY idx_instance_fast WHERE file_id IS NULL AND sha256_8kb IS NOT NULL
+    SELECT size, sha256_sample AS head, dir_id, filename
+    FROM instance INDEXED BY idx_instance_fast WHERE file_id IS NULL AND sha256_sample IS NOT NULL
 ), inst AS (
     SELECT size, head, dir_id, filename, 1 AS fast FROM fast
     UNION ALL
     SELECT i.size, k.head, i.dir_id, i.filename, 0
     FROM (SELECT DISTINCT size, head FROM fast) k
-    CROSS JOIN file f ON f.sha256_8kb = k.head
+    CROSS JOIN file f ON f.sha256_sample = k.head
     CROSS JOIN instance i ON i.file_id = f.id AND i.size = k.size
 )
 SELECT size || ':' || head, size, dir_id, filename, fast
@@ -129,7 +129,7 @@ WHERE n > 1`, filter, within)
 // hash, inside filter's dirs (nil = everywhere): fast-hashed ones, and those
 // with no hash at all.
 func (d *DB) CountNotFullyHashed(filter []int64, minSize int64) (fast, none int, err error) {
-	q, args := "SELECT COUNT(*), COUNT(sha256_8kb) FROM instance WHERE file_id IS NULL AND size >= ?", []any{minSize}
+	q, args := "SELECT COUNT(*), COUNT(sha256_sample) FROM instance WHERE file_id IS NULL AND size >= ?", []any{minSize}
 	if filter != nil {
 		ids, err := json.Marshal(filter)
 		if err != nil {

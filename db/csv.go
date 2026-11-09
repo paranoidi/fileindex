@@ -6,13 +6,13 @@ import (
 )
 
 // ExportHeader is the CSV header; one row per instance, file columns repeated.
-var ExportHeader = []string{"md5", "sha256", "sha256_noexif_jpeg", "sha256_8kb", "filesize",
+var ExportHeader = []string{"md5", "sha256", "sha256_noexif_jpeg", "sha256_sample", "filesize",
 	"file_created_at", "file_last_seen", "path", "filename", "mtime", "instance_created_at", "instance_last_seen"}
 
 // ExportRows calls fn with every instance as a row in ExportHeader order, sorted
 // by md5, dir id, filename. Unhashed instances have no md5 and are left out. NULL is "". Timestamps are the stored text.
 func (d *DB) ExportRows(fn func([]string) error) error {
-	rows, err := d.Query(`SELECT f.md5, f.sha256, f.sha256_noexif_jpeg, f.sha256_8kb, f.filesize,
+	rows, err := d.Query(`SELECT f.md5, f.sha256, f.sha256_noexif_jpeg, f.sha256_sample, f.filesize,
 CAST(f.created_at AS TEXT), CAST(f.last_seen AS TEXT), i.dir_id, i.filename, CAST(i.mtime AS TEXT),
 CAST(i.created_at AS TEXT), CAST(i.last_seen AS TEXT)
 FROM file f JOIN instance i ON f.id = i.file_id
@@ -49,11 +49,11 @@ ORDER BY f.md5, i.dir_id, i.filename`)
 
 // ImportRow is one validated CSV row; "" means empty.
 type ImportRow struct {
-	MD5, SHA256, NoExifJPEG, SHA256_8KB string
-	Size                                int64
-	FileCreated, FileLastSeen           string
-	Path, Filename, Mtime               string
-	InstCreated, InstLastSeen           string
+	MD5, SHA256, NoExifJPEG, Sample string
+	Size                            int64
+	FileCreated, FileLastSeen       string
+	Path, Filename, Mtime           string
+	InstCreated, InstLastSeen       string
 }
 
 // nullIfEmpty maps "" to NULL for nullable columns.
@@ -96,8 +96,8 @@ func (d *DB) ImportBatch(rows []ImportRow) (files, instances int, err error) {
 			switch {
 			case err == sql.ErrNoRows:
 				res, err := insertOmittingEmpty(tx, "file",
-					[]string{"md5", "sha256", "sha256_noexif_jpeg", "sha256_8kb", "filesize"},
-					[]any{r.MD5, r.SHA256, nullIfEmpty(r.NoExifJPEG), nullIfEmpty(r.SHA256_8KB), r.Size},
+					[]string{"md5", "sha256", "sha256_noexif_jpeg", "sha256_sample", "filesize"},
+					[]any{r.MD5, r.SHA256, nullIfEmpty(r.NoExifJPEG), nullIfEmpty(r.Sample), r.Size},
 					map[string]string{"created_at": r.FileCreated, "last_seen": r.FileLastSeen})
 				if err != nil {
 					return 0, 0, err

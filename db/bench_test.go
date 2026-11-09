@@ -33,7 +33,7 @@ func BenchmarkCommitScanBatch(b *testing.B) {
 			s := hex.EncodeToString(h[:])
 			name := fmt.Sprintf("%s %s %s_%d.jpg", benchWords[r.IntN(len(benchWords))], benchWords[r.IntN(len(benchWords))], benchWords[r.IntN(len(benchWords))], i)
 			files[i] = db.ScannedFile{Dir: fmt.Sprintf("/bench/d%d/sub%d", i/2000, i/400%5), Name: name, Size: 32768,
-				Mtime: time.Unix(1700000000+int64(i), 0), MD5: s[:32], SHA256: s, SHA256_8KB: s}
+				Mtime: time.Unix(1700000000+int64(i), 0), MD5: s[:32], SHA256: s, Sample: s}
 		}
 		b.StartTimer()
 		for i := 0; i < total; i += batch {
@@ -62,7 +62,7 @@ func BenchmarkPruneDir(b *testing.B) {
 			h := sha256.Sum256(fmt.Append(nil, i))
 			s := hex.EncodeToString(h[:])
 			files[i] = db.ScannedFile{Dir: dir, Name: fmt.Sprintf("%s report_%d.jpg", benchWords[i%len(benchWords)], i), Size: 1,
-				Mtime: time.Unix(1700000000, 0), MD5: s[:32], SHA256: s, SHA256_8KB: s}
+				Mtime: time.Unix(1700000000, 0), MD5: s[:32], SHA256: s, Sample: s}
 		}
 		if _, err := d.CommitScanBatch(files); err != nil {
 			b.Fatal(err)

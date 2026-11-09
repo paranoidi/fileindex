@@ -51,18 +51,18 @@ func SameMtime(stored string, t time.Time) bool {
 
 // ScannedFile is one hashed file ready to record. Dir is absolute and resolved.
 type ScannedFile struct {
-	Dir, Name               string
-	Size                    int64
-	Mtime                   time.Time
-	MD5, SHA256, SHA256_8KB string
-	NoExifJPEG              *string
+	Dir, Name           string
+	Size                int64
+	Mtime               time.Time
+	MD5, SHA256, Sample string
+	NoExifJPEG          *string
 }
 
 func (f ScannedFile) Path() string { return filepath.Join(f.Dir, f.Name) }
 
 // Recorded is the size and stored mtime ("" when NULL) of an indexed instance;
 // Hashed is false while the instance waits to be hashed, and Fast is true once
-// its first 8 KB are hashed.
+// its sample is hashed.
 type Recorded struct {
 	Size   int64
 	Mtime  string
@@ -109,7 +109,7 @@ func (d *DB) NewDirLister() (*DirLister, error) {
 	if err != nil {
 		return nil, err
 	}
-	files, err := d.Prepare(`SELECT filename, size, COALESCE(CAST(mtime AS TEXT), ''), file_id IS NOT NULL, sha256_8kb IS NOT NULL
+	files, err := d.Prepare(`SELECT filename, size, COALESCE(CAST(mtime AS TEXT), ''), file_id IS NOT NULL, sha256_sample IS NOT NULL
 FROM instance WHERE dir_id = ?`)
 	if err != nil {
 		_ = child.Close()
@@ -229,7 +229,7 @@ CROSS JOIN file f ON f.id = i.file_id CROSS JOIN content_tag ct ON ct.sha256 = f
 					return res, err
 				}
 			}
-			_, err = q.Exec("UPDATE instance SET file_id = NULL, sha256_8kb = NULL, size = ?, mtime = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?", f.Size, mtime, instID)
+			_, err = q.Exec("UPDATE instance SET file_id = NULL, sha256_sample = NULL, size = ?, mtime = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?", f.Size, mtime, instID)
 		case sql.ErrNoRows:
 			k := newKey{dirID, f.Name}
 			if j, dup := added[k]; dup {
@@ -299,7 +299,7 @@ func (d *DB) UnhashedPages(path string, skipFast bool) (*UnhashedPages, error) {
 	p := &UnhashedPages{d: d, paths: dirPaths{},
 		query: "SELECT i.id, i.dir_id, i.filename FROM instance i WHERE i.file_id IS NULL"}
 	if skipFast {
-		p.query += " AND i.sha256_8kb IS NULL"
+		p.query += " AND i.sha256_sample IS NULL"
 	}
 	id, found, err := DirByPath(d, path)
 	if err != nil {
@@ -388,7 +388,7 @@ func (d *DB) CountUnhashed(path string, skipFast bool) (int, error) {
 func (d *DB) unhashedScope(path string, skipFast bool) (string, []any, error) {
 	cols := "SELECT i.id, i.dir_id, i.filename FROM instance i WHERE i.file_id IS NULL"
 	if skipFast {
-		cols += " AND i.sha256_8kb IS NULL"
+		cols += " AND i.sha256_sample IS NULL"
 	}
 	id, found, err := DirByPath(d, path)
 	if err != nil {
@@ -453,8 +453,8 @@ func (d *DB) CommitScanBatch(files []ScannedFile) (BatchResult, error) {
 				return res, err
 			}
 			// A file_id means a full hash landed first; a fast hash must not sit beside it.
-			if _, err := q.Exec("UPDATE instance SET sha256_8kb = ?, size = ?, mtime = ?, last_seen = CURRENT_TIMESTAMP WHERE dir_id IS ? AND filename = ? AND file_id IS NULL",
-				f.SHA256_8KB, f.Size, FormatMtime(f.Mtime), dirID, f.Name); err != nil {
+			if _, err := q.Exec("UPDATE instance SET sha256_sample = ?, size = ?, mtime = ?, last_seen = CURRENT_TIMESTAMP WHERE dir_id IS ? AND filename = ? AND file_id IS NULL",
+				f.Sample, f.Size, FormatMtime(f.Mtime), dirID, f.Name); err != nil {
 				return res, err
 			}
 			continue
@@ -466,9 +466,9 @@ func (d *DB) CommitScanBatch(files []ScannedFile) (BatchResult, error) {
 			// A JPEG's fresh no-EXIF hash replaces the stored one, so scan -a repairs
 			// stale values; a non-JPEG copy of the same content keeps it.
 			ext := strings.ToLower(filepath.Ext(f.Name))
-			_, err = q.Exec(`UPDATE file SET last_seen = CURRENT_TIMESTAMP, sha256_8kb = COALESCE(sha256_8kb, ?),
+			_, err = q.Exec(`UPDATE file SET last_seen = CURRENT_TIMESTAMP, sha256_sample = COALESCE(sha256_sample, ?),
 sha256_noexif_jpeg = CASE WHEN ? THEN ? ELSE sha256_noexif_jpeg END WHERE id = ?`,
-				f.SHA256_8KB, ext == ".jpg" || ext == ".jpeg", f.NoExifJPEG, fileID)
+				f.Sample, ext == ".jpg" || ext == ".jpeg", f.NoExifJPEG, fileID)
 		case sql.ErrNoRows:
 			var other string
 			if q.QueryRow("SELECT sha256 FROM file WHERE md5 = ?", f.MD5).Scan(&other) == nil {
@@ -476,8 +476,8 @@ sha256_noexif_jpeg = CASE WHEN ? THEN ? ELSE sha256_noexif_jpeg END WHERE id = ?
 				continue
 			}
 			var r sql.Result
-			r, err = q.Exec("INSERT INTO file (md5, sha256, sha256_noexif_jpeg, sha256_8kb, filesize) VALUES (?, ?, ?, ?, ?)",
-				f.MD5, f.SHA256, f.NoExifJPEG, f.SHA256_8KB, f.Size)
+			r, err = q.Exec("INSERT INTO file (md5, sha256, sha256_noexif_jpeg, sha256_sample, filesize) VALUES (?, ?, ?, ?, ?)",
+				f.MD5, f.SHA256, f.NoExifJPEG, f.Sample, f.Size)
 			if err == nil {
 				fileID, err = r.LastInsertId()
 				newContent = append(newContent, f.SHA256)
@@ -497,7 +497,7 @@ sha256_noexif_jpeg = CASE WHEN ? THEN ? ELSE sha256_noexif_jpeg END WHERE id = ?
 		switch err {
 		case nil:
 			res.Updated++
-			_, err = q.Exec("UPDATE instance SET file_id = ?, sha256_8kb = NULL, size = ?, mtime = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?", fileID, f.Size, mtime, instID)
+			_, err = q.Exec("UPDATE instance SET file_id = ?, sha256_sample = NULL, size = ?, mtime = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?", fileID, f.Size, mtime, instID)
 		case sql.ErrNoRows:
 			k := newKey{dirID, f.Name}
 			if j, dup := added[k]; dup { // same resolved path twice in one batch: the last one wins
@@ -516,6 +516,9 @@ sha256_noexif_jpeg = CASE WHEN ? THEN ? ELSE sha256_noexif_jpeg END WHERE id = ?
 	}
 	// Before the FTS writes below, as statements after them flush FTS segments.
 	if err := markBack(q, newContent); err != nil {
+		return res, err
+	}
+	if err := reattachSampled(q); err != nil {
 		return res, err
 	}
 	if err := promotePending(q); err != nil {
@@ -570,10 +573,18 @@ type newKey struct {
 	name string
 }
 
-// DeleteInstancesInTree deletes every instance in the dir's subtree and returns the count.
+// DeleteInstancesInTree deletes every instance in the dir's subtree and returns the
+// count. Pending tags of sampled instances are kept as sample tags.
 func (d *DB) DeleteInstancesInTree(id int64) (int64, error) { return deleteInstancesInTree(d, id) }
 
 func deleteInstancesInTree(q Querier, id int64) (int64, error) {
+	if some, err := anyPending(q); err != nil {
+		return 0, err
+	} else if some {
+		if err := keepPendingTree(q, id); err != nil {
+			return 0, err
+		}
+	}
 	r, err := q.Exec(treeCTE+"DELETE FROM instance WHERE dir_id IN (SELECT id FROM dir_tree)", id)
 	if err != nil {
 		return 0, err
@@ -713,7 +724,10 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 				return files, dirs, err
 			}
 			if hasPending {
-				if err := logLostPendingFiles(q, cur.path, cur.id, string(list), log); err != nil {
+				if err := logPendingFiles(q, cur.path, cur.id, string(list), log); err != nil {
+					return files, dirs, err
+				}
+				if err := keepPendingFiles(q, cur.id, string(list)); err != nil {
 					return files, dirs, err
 				}
 			}
@@ -760,7 +774,7 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 				continue
 			}
 			if hasPending {
-				if err := logLostPendingTree(q, s.path, s.id, log); err != nil {
+				if err := logPendingTree(q, s.path, s.id, log); err != nil {
 					return files, dirs, err
 				}
 			}
@@ -782,34 +796,49 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 	return files, dirs, commit()
 }
 
-// logLostPendingFiles logs the pending tags of the named instances of a dir about
-// to lose them: the file went before its hash landed, so the tag has no content to stay on.
-func logLostPendingFiles(q Querier, dir string, id int64, names string, log func(string)) error {
-	rows, err := q.Query(`SELECT i.filename, t.name FROM instance i CROSS JOIN pending_tag p ON p.instance_id = i.id
-CROSS JOIN tag t ON t.id = p.tag_id WHERE i.dir_id = ? AND i.filename IN (SELECT value FROM json_each(?)) ORDER BY 1, 2`, id, names)
+// logPendingFiles logs the pending tags of the named instances of a dir about to
+// go: the file went before its hash landed, so the tag has no content to stay on.
+// A sampled instance's tag is kept as a sample tag; any other is lost.
+func logPendingFiles(q Querier, dir string, id int64, names string, log func(string)) error {
+	rows, err := q.Query(`SELECT i.filename, t.name, i.sha256_sample IS NOT NULL AND i.size > 0 FROM instance i
+CROSS JOIN pending_tag p ON p.instance_id = i.id CROSS JOIN tag t ON t.id = p.tag_id
+WHERE i.dir_id = ? AND i.filename IN (SELECT value FROM json_each(?)) ORDER BY 1, 2`, id, names)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var name, tag string
-		if err := rows.Scan(&name, &tag); err != nil {
+		var kept bool
+		if err := rows.Scan(&name, &tag, &kept); err != nil {
 			return err
 		}
-		log("Lost tag #" + tag + " on unhashed file: " + filepath.Join(dir, name))
+		if kept {
+			log("Kept tag #" + tag + " by sample of unhashed file: " + filepath.Join(dir, name))
+		} else {
+			log("Lost tag #" + tag + " on unhashed file: " + filepath.Join(dir, name))
+		}
 	}
 	return rows.Err()
 }
 
-// logLostPendingTree logs how many pending tags are lost with the dir tree at path.
-func logLostPendingTree(q Querier, path string, id int64, log func(string)) error {
-	var n int
-	err := q.QueryRow(treeCTE+`SELECT COUNT(*) FROM dir_tree t CROSS JOIN instance i ON i.dir_id = t.id
-CROSS JOIN pending_tag p ON p.instance_id = i.id`, id).Scan(&n)
-	if err == nil && n > 0 {
-		log(fmt.Sprintf("Lost %d tag(s) on unhashed files under: %s", n, path))
+// logPendingTree logs how many pending tags the dir tree at path keeps by sample
+// and how many it loses.
+func logPendingTree(q Querier, path string, id int64, log func(string)) error {
+	var kept, lost int
+	err := q.QueryRow(treeCTE+`SELECT COALESCE(SUM(i.sha256_sample IS NOT NULL AND i.size > 0), 0),
+COALESCE(SUM(i.sha256_sample IS NULL OR i.size = 0), 0) FROM dir_tree t CROSS JOIN instance i ON i.dir_id = t.id
+CROSS JOIN pending_tag p ON p.instance_id = i.id`, id).Scan(&kept, &lost)
+	if err != nil {
+		return err
 	}
-	return err
+	if kept > 0 {
+		log(fmt.Sprintf("Kept %d tag(s) by sample of unhashed files under: %s", kept, path))
+	}
+	if lost > 0 {
+		log(fmt.Sprintf("Lost %d tag(s) on unhashed files under: %s", lost, path))
+	}
+	return nil
 }
 
 func (d *DB) strings(query string, args ...any) ([]string, error) {
@@ -1004,6 +1033,9 @@ func (d *DB) RemoveInstance(path string) (RemovedTree, error) {
 		return r, notFound
 	}
 	if err != nil {
+		return r, err
+	}
+	if err := keepPendingInstance(tx, id); err != nil {
 		return r, err
 	}
 	if _, err := tx.Exec("DELETE FROM instance WHERE id = ?", id); err != nil {

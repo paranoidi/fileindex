@@ -296,15 +296,22 @@ func (d *DB) DeleteTag(name string) (int, error) {
 }
 
 // TagGC deletes the content tags whose content has been absent for more than days
-// days, and returns how many. Content that has a file row keeps its tags whatever
-// gone_at says: only this deletes a tag on age, so it must never cost a live one.
+// days, and the sample tags kept that long, and returns how many. Content that has
+// a file row keeps its tags whatever gone_at says: only this deletes a tag on age,
+// so it must never cost a live one.
 func (d *DB) TagGC(days int) (int64, error) {
+	age := fmt.Sprintf("-%d days", days)
 	r, err := d.Exec(`DELETE FROM content_tag WHERE gone_at IS NOT NULL AND gone_at <= datetime('now', ?)
-AND NOT EXISTS (SELECT 1 FROM file f WHERE f.sha256 = content_tag.sha256)`, fmt.Sprintf("-%d days", days))
+AND NOT EXISTS (SELECT 1 FROM file f WHERE f.sha256 = content_tag.sha256)`, age)
 	if err != nil {
 		return 0, err
 	}
-	return r.RowsAffected()
+	n, _ := r.RowsAffected()
+	if r, err = d.Exec("DELETE FROM sample_tag WHERE kept_at <= datetime('now', ?)", age); err != nil {
+		return n, err
+	}
+	m, _ := r.RowsAffected()
+	return n + m, nil
 }
 
 // FindByTags returns files directly in dir (whole tree with recursive) and dirs

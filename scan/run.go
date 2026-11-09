@@ -26,7 +26,7 @@ type Options struct {
 	Workers     int  // hash workers; 0 = auto-scale
 	MissingOnly bool // skip files indexed and hashed with the same size and mtime (the CLI's default; --all turns it off)
 	SkipHash    bool // index and prune only: new and changed files stay unhashed, findable by name, until a later run hashes them
-	Fast        bool // hash only the first 8 KB of files larger than that; they stay unhashed until a later run without Fast
+	Fast        bool // hash only the sample (first, middle and last 8 KB) of larger files; they stay unhashed until a later run without Fast
 	BatchFiles  int  // files per commit; 0 = 1000. Smaller batches make a cancel land sooner.
 	// BatchInterval, when > 0, commits a batch once this long has passed since its
 	// first file instead of after BatchFiles files. Every commit flushes the
@@ -124,7 +124,7 @@ func ResolveRoots(args []string) ([]string, error) {
 // names leave the index before any hashing. Phase 2 hashes every unhashed
 // instance under the roots, including ones left by an interrupted or SkipHash
 // run, and commits batches in the background. SkipHash stops after pruning.
-// Fast stores only a first-8-KB hash on the instance, skipping instances that
+// Fast stores only the sample hash on the instance, skipping instances that
 // have one; an instance with a full hash is never touched.
 // A cancel in any stage skips the later ones.
 //
@@ -530,11 +530,11 @@ func hashPaths(ctx context.Context, d *db.DB, opt Options, maxFiles int, paths i
 		}
 		batch = append(batch, db.ScannedFile{
 			Dir: filepath.Dir(h.Path), Name: filepath.Base(h.Path), Size: h.Size, Mtime: h.Mtime,
-			MD5: h.Hashes.MD5, SHA256: h.Hashes.SHA256, SHA256_8KB: h.Hashes.SHA256_8KB, NoExifJPEG: h.Hashes.NoExifJPEG,
+			MD5: h.Hashes.MD5, SHA256: h.Hashes.SHA256, Sample: h.Hashes.Sample, NoExifJPEG: h.Hashes.NoExifJPEG,
 		})
 		read := h.Size
-		if h.Hashes.SHA256 == "" { // fast: only the head was read
-			read = min(read, headSize)
+		if h.Hashes.SHA256 == "" { // fast: only the sample was read
+			read = sampleRead(read)
 		}
 		res.Processed++
 		res.TotalSize += read

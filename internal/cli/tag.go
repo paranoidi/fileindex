@@ -217,7 +217,9 @@ func tagGCCmd(a *app) *cobra.Command {
 		Long: `Delete tags on content that has been gone for more than DAYS days.
 
 A tag stays when its content leaves the index, so it can come back with the content.
-Nothing else deletes tags on age. 0 deletes the tags of all content currently gone.`,
+A tag on a file that left before its full hash stays by the file's sample hash, if
+it had one, and is deleted here the same way. Nothing else deletes tags on age.
+0 deletes the tags of all content currently gone.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			days, err := strconv.Atoi(args[0])

@@ -14,11 +14,11 @@ const treeCTE = `WITH RECURSIVE dir_tree AS (
 
 // Match is one instance of a file found by hash.
 type Match struct {
-	Path                    string
-	Size                    int64
-	MD5, SHA256, SHA256_8KB string
-	NoExifJPEG              string // "" when NULL
-	Mtime                   string // raw stored text, "" when NULL
+	Path                string
+	Size                int64
+	MD5, SHA256, Sample string
+	NoExifJPEG          string // "" when NULL
+	Mtime               string // raw stored text, "" when NULL
 }
 
 // FindByHash returns every instance whose file has h as any of its four hashes,
@@ -31,9 +31,9 @@ func (d *DB) FindByHash(h string) ([]Match, error) {
 	}
 	defer tx.Rollback()
 	rows, err := tx.Query(`SELECT i.dir_id, i.filename, i.size, f.md5, f.sha256,
-COALESCE(f.sha256_8kb, ''), COALESCE(f.sha256_noexif_jpeg, ''), COALESCE(CAST(i.mtime AS TEXT), '')
+COALESCE(f.sha256_sample, ''), COALESCE(f.sha256_noexif_jpeg, ''), COALESCE(CAST(i.mtime AS TEXT), '')
 FROM file f JOIN instance i ON f.id = i.file_id
-WHERE f.md5 = ?1 OR f.sha256 = ?1 OR f.sha256_noexif_jpeg = ?1 OR f.sha256_8kb = ?1`, h)
+WHERE f.md5 = ?1 OR f.sha256 = ?1 OR f.sha256_noexif_jpeg = ?1 OR f.sha256_sample = ?1`, h)
 	if err != nil {
 		return nil, err
 	}
@@ -45,7 +45,7 @@ WHERE f.md5 = ?1 OR f.sha256 = ?1 OR f.sha256_noexif_jpeg = ?1 OR f.sha256_8kb =
 	var found []raw
 	for rows.Next() {
 		var r raw
-		if err := rows.Scan(&r.dir, &r.name, &r.m.Size, &r.m.MD5, &r.m.SHA256, &r.m.SHA256_8KB, &r.m.NoExifJPEG, &r.m.Mtime); err != nil {
+		if err := rows.Scan(&r.dir, &r.name, &r.m.Size, &r.m.MD5, &r.m.SHA256, &r.m.Sample, &r.m.NoExifJPEG, &r.m.Mtime); err != nil {
 			rows.Close()
 			return nil, err
 		}
