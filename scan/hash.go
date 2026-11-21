@@ -191,11 +191,17 @@ func hashContent(path string, size int64, read *atomic.Int64) (Hashes, error) {
 func md5Hex(b []byte) string    { s := md5.Sum(b); return hex.EncodeToString(s[:]) }
 func sha256Hex(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }
 
-// tick is how often HashAll measures speed and may rescale; holdTicks is how
-// many steady ticks pass before auto mode probes another worker count.
+// tick is how often HashAll measures speed and may rescale. Auto mode
+// averages holdTicks steady ticks into a baseline before probing another
+// worker count, then skips settleTicks (workers starting or finishing a file)
+// and averages probeTicks to judge the probe.
 var tick = 2 * time.Second
 
-const holdTicks = 5
+const (
+	holdTicks   = 5
+	settleTicks = 1
+	probeTicks  = 3
+)
 
 // HashAll hashes paths with `workers` goroutines and yields results in
 // completion order (input order when workers == 1). workers == 0 auto-scales:
@@ -275,7 +281,7 @@ func HashAll(ctx context.Context, paths iter.Seq[string], workers int, fast bool
 		defer release()
 		go func() { wg.Wait(); close(out) }()
 
-		s := scaler{n: max(workers, 1), hold: holdTicks - 1}
+		s := scaler{n: max(workers, 1), ticks: holdTicks - 1} // first probe on the first tick
 		resize(s.n)
 		t := time.NewTicker(tick)
 		defer t.Stop()
@@ -308,44 +314,67 @@ func HashAll(ctx context.Context, paths iter.Seq[string], workers int, fast bool
 
 // scaler hill-climbs the worker count on hashing speed. It probes one step
 // (alternately up and down), keeps going while that pays off and undoes it
-// when it doesn't. Going up must gain 5%; going down may lose up to 5%, so
-// ties favour fewer workers.
-// ponytail: no upper cap; the 5% margin stops growth. Add one if noisy disks overshoot.
+// when it doesn't. Speeds are window means, not single ticks, so one lucky
+// tick can't buy a worker. Worker n+1 must gain need(n) to be added, and is
+// dropped when losing it costs less than that, so ties favour fewer workers.
+// ponytail: no upper cap; need() stops growth. Add one if noisy disks overshoot.
 type scaler struct {
-	n    int
-	dir  int     // move being tried: +1, -1, or 0 when holding
-	hold int     // steady ticks since the last decision
-	prev float64 // speed before the move being tried
-	down bool    // next probe goes down
+	n       int
+	dir     int     // move being tried: +1, -1, or 0 when holding
+	ticks   int     // ticks in the current window
+	samples int     // ticks summed into sum (settle ticks are not)
+	sum     float64 // speed summed over the window
+	base    float64 // mean speed before the move being tried
+	down    bool    // next probe goes down
 }
+
+// need is the gain worker n+1 must bring: a quarter of perfect scaling, never
+// under 5%. 1->2 needs 25%, 2->3 12.5%, 5+ 5%.
+func need(n int) float64 { return max(0.05, 0.25/float64(n)) }
 
 func (s *scaler) step(bps float64) int {
 	if bps == 0 { // nothing read (e.g. waiting on discovery): no signal
 		return s.n
 	}
-	switch {
-	case s.dir > 0 && bps > s.prev*1.05, s.dir < 0 && bps >= s.prev*0.95:
-		// paid off: keep going
-	case s.dir != 0:
-		s.n -= s.dir // undo, keep the old baseline
-		s.dir, s.hold = 0, 0
-		return s.n
-	default:
-		s.prev = bps
-		if s.hold++; s.hold < holdTicks {
+	if s.ticks++; s.dir == 0 || s.ticks > settleTicks {
+		s.sum += bps
+		s.samples++
+	}
+	if s.dir == 0 {
+		if s.ticks < holdTicks {
 			return s.n
 		}
-		s.hold, s.dir = 0, 1
+		s.base = s.sum / float64(s.samples)
+		s.dir = 1
 		if s.down && s.n > 1 {
 			s.dir = -1
 		}
 		s.down = !s.down
+		return s.move()
 	}
+	if s.ticks < settleTicks+probeTicks {
+		return s.n
+	}
+	mean := s.sum / float64(s.samples)
+	if s.dir > 0 && mean > s.base*(1+need(s.n-1)) || s.dir < 0 && mean >= s.base*(1-need(s.n)) {
+		s.base = mean // paid off: keep going
+		return s.move()
+	}
+	s.n -= s.dir // undo, then hold for a fresh baseline
+	s.dir = 0
+	s.reset()
+	return s.n
+}
+
+// move takes one step in dir, or starts holding when that would leave no workers.
+func (s *scaler) move() int {
+	s.reset()
 	if s.n+s.dir < 1 {
 		s.dir = 0
 		return s.n
 	}
-	s.prev = bps
 	s.n += s.dir
 	return s.n
 }
+
+func (s *scaler) reset() { s.ticks, s.samples, s.sum = 0, 0, 0 }

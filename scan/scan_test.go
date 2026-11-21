@@ -336,35 +336,46 @@ func TestHashAll(t *testing.T) {
 }
 
 func TestScaler(t *testing.T) {
-	s := scaler{n: 1, hold: holdTicks - 1}
+	s := scaler{n: 1, ticks: holdTicks - 1}
 	run := func(bps float64, want int) {
 		t.Helper()
 		if got := s.step(bps); got != want {
 			t.Fatalf("step(%v) = %d, want %d", bps, got, want)
 		}
 	}
-	run(0, 1)   // no signal: no change
-	run(100, 2) // first tick probes up
-	run(200, 3) // gained: keep going
-	run(300, 4)
-	run(305, 3) // under 5% gain: undo
-	for range holdTicks - 1 {
-		run(300, 3) // hold
+	// hold: holdTicks ticks at bps, the last one may probe
+	hold := func(bps float64, want int) {
+		t.Helper()
+		for range holdTicks - 1 {
+			run(bps, s.n)
+		}
+		run(bps, want)
 	}
-	run(300, 2) // probe down
-	run(290, 1) // within 5%: fewer workers is fine, keep going
-	run(280, 1) // can't go below 1
-	for range holdTicks - 1 {
-		run(280, 1)
+	// probe: a settle tick that must not count, then probeTicks ticks
+	probe := func(want int, bps ...float64) {
+		t.Helper()
+		run(9999, s.n)
+		for _, b := range bps[:len(bps)-1] {
+			run(b, s.n)
+		}
+		run(bps[len(bps)-1], want)
 	}
-	run(280, 2) // probe up
-	run(200, 1) // dropped: undo
-	for range holdTicks - 1 {
-		run(280, 1)
-	}
-	run(280, 2) // n == 1, so probe up even though down was due
-	run(500, 3)
-	run(400, 2) // dropped: scale back
+	run(0, 1)               // no signal: no change
+	run(100, 2)             // first tick probes up
+	probe(3, 130, 130, 130) // 1->2 gained 30% (needs 25%): keep going
+	probe(2, 140, 140, 140) // 2->3 gained 8% (needs 12.5%): undo
+	hold(140, 1)            // probe down
+	probe(1, 110, 110, 110) // lost 21% (may lose 25%): keep going, can't go below 1
+	hold(110, 2)            // probe up
+	probe(1, 120, 120, 170) // one lucky tick: mean gain 24%, undo
+	hold(110, 2)            // n == 1, so probe up even though down was due
+	probe(3, 150, 150, 150) // +36%
+	probe(4, 200, 200, 200) // +33%
+	probe(3, 200, 200, 200) // no gain: undo
+	hold(200, 4)            // probe up
+	probe(3, 205, 205, 205) // +2.5%: undo
+	hold(200, 2)            // probe down
+	probe(3, 160, 160, 160) // lost 20% (may lose 12.5%): undo
 }
 
 // A library caller must never get log text on its terminal: walk warnings go to
