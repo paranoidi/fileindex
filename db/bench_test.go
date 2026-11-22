@@ -135,6 +135,47 @@ SELECT id, 2, 'f' || id, 'f' || id, 1 FROM file`); err != nil {
 	}
 }
 
+// seedDuplicates inserts n file rows, each with two instances spread over the
+// first 1000 dirs of a seedDirs tree, so every file is a duplicate group.
+func seedDuplicates(b *testing.B, d *db.DB, n int) {
+	b.Helper()
+	seedDirs(b, d, 1001)
+	if _, err := d.Exec(`WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < ?)
+INSERT INTO file (id, md5, sha256, filesize) SELECT i, 'm' || i, 's' || i, 1 FROM s`, n); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := d.Exec(`INSERT INTO instance (file_id, dir_id, filename, filename_lower, size)
+SELECT id, 2 + id % 1000, 'f' || id, 'f' || id, 1 FROM file;
+INSERT INTO instance (file_id, dir_id, filename, filename_lower, size)
+SELECT id, 2 + (id * 37 + 1) % 1000, 'g' || id, 'g' || id, 1 FROM file`); err != nil {
+		b.Fatal(err)
+	}
+}
+
+// BenchmarkDuplicates reads the groups of 100k duplicated files, from the whole
+// index and from one subtree, whose cost should follow the subtree.
+func BenchmarkDuplicates(b *testing.B) {
+	d := dbtest.New(b)
+	seedDuplicates(b, d, 100000)
+	sub := int64(2)
+	ids, err := db.TreeIDs(d, &sub, true)
+	if err != nil || len(ids) < 2 {
+		b.Fatal(ids, err)
+	}
+	for _, c := range []struct {
+		name   string
+		filter []int64
+	}{{"all", nil}, {"filtered", ids}} {
+		b.Run(c.name, func(b *testing.B) {
+			for b.Loop() {
+				if groups, err := d.Duplicates(c.filter, false); err != nil || len(groups) == 0 {
+					b.Fatal(len(groups), err)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkDeleteOrphans sweeps 500k file rows with none to delete: what every
 // scan that changes something pays.
 func BenchmarkDeleteOrphans(b *testing.B) {

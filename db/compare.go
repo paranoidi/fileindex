@@ -78,7 +78,32 @@ type DupGroup struct {
 // filter (a dir tree's ids), a group is kept if any instance is inside it, or
 // with within, only if all are. Instances are read as rows, so names with
 // "; " are safe.
+//
+// Without a filter it reads the whole index. With one, the query starts from the
+// content keys of the filter's dirs and looks the other copies up through the
+// file hash indexes, so its cost follows the filter, not the index; a group
+// inside the filter always has a key there. An empty non-nil filter has none.
 func (d *DB) Duplicates(filter []int64, within bool) ([]DupGroup, error) {
+	if filter != nil {
+		ids, err := json.Marshal(filter)
+		if err != nil {
+			return nil, err
+		}
+		// A key's members are the Files sharing its no-EXIF hash, plus the non-JPEG Files
+		// whose sha256 is the key (a stripped JPEG stored under a non-JPEG name). CROSS JOIN
+		// fixes the order so each lookup uses idx_file_sha256_noexif_jpeg or idx_file_sha256.
+		return d.dupGroups(`WITH keys(k) AS (
+    SELECT DISTINCT COALESCE(f.sha256_noexif_jpeg, f.sha256)
+    FROM instance i CROSS JOIN file f ON f.id = i.file_id
+    WHERE i.dir_id IN (SELECT value FROM json_each(?)) AND f.filesize > 0
+), members(id, k) AS (
+    SELECT f.id, keys.k FROM keys CROSS JOIN file f ON f.sha256_noexif_jpeg = keys.k
+    UNION
+    SELECT f.id, keys.k FROM keys CROSS JOIN file f ON f.sha256 = keys.k WHERE f.sha256_noexif_jpeg IS NULL
+)
+SELECT m.k, f.filesize, i.dir_id, i.filename, 0
+FROM members m CROSS JOIN file f ON f.id = m.id CROSS JOIN instance i ON i.file_id = f.id`, filter, within, string(ids))
+	}
 	// Finds the file rows in a group from indexes alone, then reads only those: a File
 	// with 2+ instances, Files sharing a no-EXIF hash, and a File whose sha256 is another
 	// one's no-EXIF hash (a stripped JPEG stored under a non-JPEG name). Grouping every
@@ -143,9 +168,11 @@ func (d *DB) CountNotFullyHashed(filter []int64, minSize int64) (fast, none int,
 }
 
 // dupGroups groups query's rows (key, size, dir_id, filename, fast) by key,
-// applies filter and within, and sorts the groups biggest first.
-func (d *DB) dupGroups(query string, filter []int64, within bool) ([]DupGroup, error) {
-	rows, err := d.Query(query)
+// drops groups with under 2 instances, applies filter and within, and sorts the
+// groups biggest first. args are the query's arguments. Dir paths are resolved
+// only for the groups kept.
+func (d *DB) dupGroups(query string, filter []int64, within bool, args ...any) ([]DupGroup, error) {
+	rows, err := d.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -178,15 +205,8 @@ func (d *DB) dupGroups(query string, filter []int64, within bool) ([]DupGroup, e
 	for _, id := range filter {
 		inFilter[id] = true
 	}
-	type keyed struct {
-		hash string
-		g    DupGroup
-	}
-	var groups []keyed
-	paths := dirPaths{}
-	if err := paths.loadAll(d); err != nil {
-		return nil, err
-	}
+	var kept []string
+	var dirs []int64
 	for _, h := range order {
 		insts := byHash[h]
 		if len(insts) < 2 {
@@ -203,6 +223,25 @@ func (d *DB) dupGroups(query string, filter []int64, within bool) ([]DupGroup, e
 				continue
 			}
 		}
+		kept = append(kept, h)
+		for _, in := range insts {
+			dirs = append(dirs, in.dir)
+		}
+	}
+	if len(kept) == 0 {
+		return nil, nil
+	}
+	paths := dirPaths{}
+	if err := paths.preload(d, dirs); err != nil {
+		return nil, err
+	}
+	type keyed struct {
+		hash string
+		g    DupGroup
+	}
+	var groups []keyed
+	for _, h := range kept {
+		insts := byHash[h]
 		g := DupGroup{Size: insts[0].size}
 		var total, largest int64
 		for _, in := range insts {

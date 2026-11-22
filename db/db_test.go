@@ -979,6 +979,83 @@ FROM file f JOIN instance i ON i.file_id = f.id WHERE f.filesize > 0`)
 	}
 }
 
+// A filtered Duplicates must equal the whole-index groups kept by the same rule.
+func TestDuplicatesFilteredMatchesWholeIndex(t *testing.T) {
+	d := dbtest.New(t)
+	mtime := time.Unix(1700000000, 0)
+	var batch []db.ScannedFile
+	add := func(dir, name, sha string, size int64, noexif string) {
+		f := db.ScannedFile{Dir: dir, Name: name, Size: size, Mtime: mtime, MD5: "md5" + sha, SHA256: sha, Sample: "h"}
+		if noexif != "" {
+			f.NoExifJPEG = &noexif
+		}
+		batch = append(batch, f)
+	}
+	add("/m/in", "river.jpg", "with-exif", 10, "stripped1") // stripped JPEG under a non-JPEG name, outside
+	add("/m/out", "cloud.bin", "stripped1", 10, "")
+	add("/m/in/sub", "apple.bin", "inside", 10, "") // a group fully inside
+	add("/m/in/sub", "pear.bin", "inside", 10, "")
+	add("/m/in", "lemon.bin", "span", 10, "") // a group spanning in and out
+	add("/m/out", "grape.bin", "span", 10, "")
+	add("/m/out", "stone.bin", "outside", 10, "") // a group fully outside
+	add("/m/out", "brick.bin", "outside", 10, "")
+	add("/m/in", "empty.bin", "zero", 0, "") // zero-size files never group
+	add("/m/in", "void.bin", "zero", 0, "")
+	add("/m/in2", "forest.jpg", "with-exif2", 10, "stripped2") // cross-key pair fully inside
+	add("/m/in2", "moss.bin", "stripped2", 10, "")
+	add("/m/in2", "ocean.bin", "stripped3", 10, "") // non-JPEG name inside, its JPEG outside
+	add("/m/out", "wave.jpg", "with-exif3", 10, "stripped3")
+	if res, err := d.CommitScanBatch(batch); err != nil || len(res.Failed) > 0 {
+		t.Fatalf("%+v, %v", res, err)
+	}
+	all, err := d.Duplicates(nil, false)
+	if err != nil || len(all) == 0 {
+		t.Fatalf("Duplicates(nil) = %+v, %v", all, err)
+	}
+	locations := func(groups []db.DupGroup) [][]string {
+		var out [][]string
+		for _, g := range groups {
+			out = append(out, g.Locations)
+		}
+		slices.SortFunc(out, slices.Compare)
+		return out
+	}
+	for _, sub := range []string{"/m/in", "/m/in/sub", "/m/in2", "/m/out", "/m"} {
+		id, ok, err := db.DirByPath(d, sub)
+		if err != nil || !ok {
+			t.Fatalf("DirByPath(%s) = %v, %v", sub, ok, err)
+		}
+		ids, err := db.TreeIDs(d, id, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, within := range []bool{false, true} {
+			var want []db.DupGroup
+			for _, g := range all {
+				n := 0
+				for _, p := range g.Locations {
+					if p == sub || strings.HasPrefix(p, sub+"/") {
+						n++
+					}
+				}
+				if n > 0 && (!within || n == len(g.Locations)) {
+					want = append(want, g)
+				}
+			}
+			got, err := d.Duplicates(ids, within)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(locations(got), locations(want)) {
+				t.Errorf("Duplicates(%s, within=%v) = %v, want %v", sub, within, locations(got), locations(want))
+			}
+		}
+	}
+	if groups, err := d.Duplicates([]int64{}, false); err != nil || len(groups) != 0 {
+		t.Errorf("Duplicates(empty filter) = %+v, %v", groups, err)
+	}
+}
+
 func TestDirListerReusesAndRefreshes(t *testing.T) {
 	d := dbtest.New(t)
 	dbtest.AddFile(t, d, "/a/b/c/one", "1")
