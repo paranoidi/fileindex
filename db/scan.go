@@ -209,6 +209,7 @@ func (d *DB) CommitDiscovered(files []DiscoveredFile, dirs []string) (BatchResul
 	dirIDs := map[string]*int64{}
 	var newRows [][]any
 	added := map[newKey]int{}
+	deltas := unhashedDeltas{}
 	for _, f := range files {
 		dirID, ok := dirIDs[f.Dir]
 		if !ok {
@@ -219,10 +220,14 @@ func (d *DB) CommitDiscovered(files []DiscoveredFile, dirs []string) (BatchResul
 		}
 		mtime := FormatMtime(f.Mtime)
 		var instID int64
-		err := q.QueryRow("SELECT id FROM instance WHERE dir_id IS ? AND filename = ?", dirID, f.Name).Scan(&instID)
+		var hashed bool
+		err := q.QueryRow("SELECT id, file_id IS NOT NULL FROM instance WHERE dir_id IS ? AND filename = ?", dirID, f.Name).Scan(&instID, &hashed)
 		switch err {
 		case nil:
 			res.Updated++
+			if hashed {
+				deltas.add(dirID, 1)
+			}
 			if tagged { // before file_id goes: the new content inherits the old one's tags
 				if _, err := q.Exec(`INSERT OR IGNORE INTO pending_tag (tag_id, instance_id) SELECT ct.tag_id, i.id FROM instance i
 CROSS JOIN file f ON f.id = i.file_id CROSS JOIN content_tag ct ON ct.sha256 = f.sha256 WHERE i.id = ?`, instID); err != nil {
@@ -238,6 +243,7 @@ CROSS JOIN file f ON f.id = i.file_id CROSS JOIN content_tag ct ON ct.sha256 = f
 				continue
 			}
 			res.Added++
+			deltas.add(dirID, 1)
 			err = nil
 			added[k] = len(newRows)
 			newRows = append(newRows, []any{nil, dirID, f.Name, Lower(f.Name), f.Size, mtime})
@@ -245,6 +251,10 @@ CROSS JOIN file f ON f.id = i.file_id CROSS JOIN content_tag ct ON ct.sha256 = f
 		if err != nil {
 			return res, err
 		}
+	}
+	// Before insertInstances: FTS5 flushes a segment at every statement after its writes.
+	if err := bumpUnhashed(q, deltas); err != nil {
+		return res, err
 	}
 	if err := insertInstances(tx, newRows); err != nil {
 		return res, err
@@ -435,6 +445,7 @@ func (d *DB) CommitScanBatch(files []ScannedFile) (BatchResult, error) {
 	var newRows [][]any         // instances to insert, in one statement at the end
 	added := map[newKey]int{}   // index into newRows
 	var newContent []string     // sha256 of each new file row
+	deltas := unhashedDeltas{}  // instances that gained a file
 	dirOf := func(dir string) (*int64, error) {
 		id, ok := dirs[dir]
 		if !ok {
@@ -493,10 +504,14 @@ sha256_noexif_jpeg = CASE WHEN ? THEN ? ELSE sha256_noexif_jpeg END WHERE id = ?
 		}
 		mtime := FormatMtime(f.Mtime)
 		var instID int64
-		err = q.QueryRow("SELECT id FROM instance WHERE dir_id IS ? AND filename = ?", dirID, f.Name).Scan(&instID)
+		var unhashed bool
+		err = q.QueryRow("SELECT id, file_id IS NULL FROM instance WHERE dir_id IS ? AND filename = ?", dirID, f.Name).Scan(&instID, &unhashed)
 		switch err {
 		case nil:
 			res.Updated++
+			if unhashed { // a path twice in a batch counts once: the second SELECT sees the first UPDATE
+				deltas.add(dirID, -1)
+			}
 			_, err = q.Exec("UPDATE instance SET file_id = ?, sha256_sample = NULL, size = ?, mtime = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?", fileID, f.Size, mtime, instID)
 		case sql.ErrNoRows:
 			k := newKey{dirID, f.Name}
@@ -515,6 +530,9 @@ sha256_noexif_jpeg = CASE WHEN ? THEN ? ELSE sha256_noexif_jpeg END WHERE id = ?
 		}
 	}
 	// Before the FTS writes below, as statements after them flush FTS segments.
+	if err := bumpUnhashed(q, deltas); err != nil {
+		return res, err
+	}
 	if err := markBack(q, newContent); err != nil {
 		return res, err
 	}
@@ -573,10 +591,9 @@ type newKey struct {
 	name string
 }
 
-// DeleteInstancesInTree deletes every instance in the dir's subtree and returns the
-// count. Pending tags of sampled instances are kept as sample tags.
-func (d *DB) DeleteInstancesInTree(id int64) (int64, error) { return deleteInstancesInTree(d, id) }
-
+// deleteInstancesInTree deletes every instance in the dir's subtree and returns the
+// count. Pending tags of sampled instances are kept as sample tags. The dirs'
+// counts are the caller's to settle.
 func deleteInstancesInTree(q Querier, id int64) (int64, error) {
 	if some, err := anyPending(q); err != nil {
 		return 0, err
@@ -643,8 +660,15 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 	if err := q.QueryRow("SELECT EXISTS (SELECT 1 FROM pending_tag)").Scan(&hasPending); err != nil {
 		return 0, 0, err
 	}
-	var touched []string // dirs changed since the last commit
+	var touched []string       // dirs changed since the last commit
+	deltas := unhashedDeltas{} // unhashed instances lost since the last commit
 	commit := func() error {
+		// One bump per commit, on the current tx. A dir with a delta is never deleted
+		// later in the run: its parent was processed before it.
+		if err := bumpUnhashed(tx, deltas); err != nil {
+			return err
+		}
+		clear(deltas)
 		if err := tx.Commit(); err != nil {
 			return err
 		}
@@ -731,6 +755,17 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 					return files, dirs, err
 				}
 			}
+			var unhashed int64
+			if err := q.QueryRow("SELECT unhashed_below FROM dir WHERE id = ?", cur.id).Scan(&unhashed); err != nil {
+				return files, dirs, err
+			}
+			if unhashed > 0 { // counting is the dear part, so only where there is something to count
+				if err := q.QueryRow("SELECT COUNT(*) FROM instance WHERE dir_id = ? AND file_id IS NULL AND filename IN (SELECT value FROM json_each(?))",
+					cur.id, string(list)).Scan(&unhashed); err != nil {
+					return files, dirs, err
+				}
+			}
+			deltas.add(&cur.id, -unhashed)
 			r, err := tx.Exec("DELETE FROM instance WHERE dir_id = ? AND filename IN (SELECT value FROM json_each(?))", cur.id, string(list))
 			if err != nil {
 				return files, dirs, err
@@ -778,10 +813,11 @@ func (d *DB) PruneDir(ctx context.Context, path string, id int64, onDir func(dir
 					return files, dirs, err
 				}
 			}
-			f, n, err := deleteTree(tx, s.id, s.path, log)
+			f, n, unhashed, err := deleteTree(tx, s.id, s.path, log)
 			if err != nil {
 				return files, dirs, err
 			}
+			deltas.add(&cur.id, -unhashed)
 			files, dirs, pending = files+f, dirs+n, pending+f+n
 			removedDir = true
 			log("Pruning removed directory: " + s.path)
@@ -970,8 +1006,14 @@ CROSS JOIN instance i ON i.dir_id = t.id WHERE i.file_id IS NOT NULL`, *id)
 	if err != nil {
 		return r, err
 	}
-	if r.Instances, r.Dirs, err = deleteTree(tx, *id, path, nil); err != nil {
+	var unhashed int64
+	if r.Instances, r.Dirs, unhashed, err = deleteTree(tx, *id, path, nil); err != nil {
 		return r, err
+	}
+	if parent.Valid { // before the empty ancestors go
+		if err := bumpUnhashed(tx, unhashedDeltas{parent.Int64: -unhashed}); err != nil {
+			return r, err
+		}
 	}
 	for parent.Valid {
 		cur := parent.Int64
@@ -1042,6 +1084,11 @@ func (d *DB) RemoveInstance(path string) (RemovedTree, error) {
 	}
 	if err != nil {
 		return r, err
+	}
+	if !fileID.Valid {
+		if err := bumpUnhashed(tx, unhashedDeltas{*dirID: -1}); err != nil {
+			return r, err
+		}
 	}
 	if err := keepPendingInstance(tx, id); err != nil {
 		return r, err

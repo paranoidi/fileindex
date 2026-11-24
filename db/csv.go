@@ -89,6 +89,7 @@ func (d *DB) ImportBatch(rows []ImportRow) (files, instances int, err error) {
 	}
 	defer tx.Rollback()
 	fileIDs := map[string]int64{}
+	deltas := unhashedDeltas{} // instances that gained a file
 	for _, r := range rows {
 		fileID, seen := fileIDs[r.MD5]
 		if !seen {
@@ -119,7 +120,8 @@ func (d *DB) ImportBatch(rows []ImportRow) (files, instances int, err error) {
 			return 0, 0, err
 		}
 		var instID int64
-		err = tx.QueryRow("SELECT id FROM instance WHERE dir_id = ? AND filename = ?", dirID, r.Filename).Scan(&instID)
+		var unhashed bool
+		err = tx.QueryRow("SELECT id, file_id IS NULL FROM instance WHERE dir_id = ? AND filename = ?", dirID, r.Filename).Scan(&instID, &unhashed)
 		switch err {
 		case sql.ErrNoRows:
 			_, err = insertOmittingEmpty(tx, "instance",
@@ -128,12 +130,18 @@ func (d *DB) ImportBatch(rows []ImportRow) (files, instances int, err error) {
 				map[string]string{"created_at": r.InstCreated, "last_seen": r.InstLastSeen})
 			instances++
 		case nil:
+			if unhashed {
+				deltas.add(dirID, -1)
+			}
 			_, err = tx.Exec("UPDATE instance SET file_id = ?, size = ?, mtime = ?, last_seen = COALESCE(?, last_seen) WHERE id = ?",
 				fileID, r.Size, nullIfEmpty(r.Mtime), nullIfEmpty(r.InstLastSeen), instID)
 		}
 		if err != nil {
 			return 0, 0, err
 		}
+	}
+	if err := bumpUnhashed(tx, deltas); err != nil {
+		return 0, 0, err
 	}
 	return files, instances, tx.Commit()
 }

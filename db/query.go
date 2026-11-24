@@ -212,6 +212,8 @@ type ListedFile struct {
 type ListedDir struct {
 	Name string
 	Tags []string
+	// Unhashed is true while an instance under the dir waits to be hashed.
+	Unhashed bool
 }
 
 // ListDir returns a dir's files and subdirs, each sorted by name, with their
@@ -244,12 +246,18 @@ FROM instance i WHERE i.dir_id = ? ORDER BY i.filename`, id)
 	if tags, err = d.tagsByName(subdirTags, id); err != nil {
 		return nil, nil, err
 	}
-	names, err := d.strings("SELECT name FROM dir WHERE parent_id = ? ORDER BY name", id)
+	rows, err = d.Query("SELECT name, unhashed_below > 0 FROM dir WHERE parent_id = ? ORDER BY name", id)
 	if err != nil {
 		return nil, nil, err
 	}
-	for _, n := range names {
-		subdirs = append(subdirs, ListedDir{Name: n, Tags: tags[n]})
+	defer rows.Close()
+	for rows.Next() {
+		var s ListedDir
+		if err := rows.Scan(&s.Name, &s.Unhashed); err != nil {
+			return nil, nil, err
+		}
+		s.Tags = tags[s.Name]
+		subdirs = append(subdirs, s)
 	}
-	return files, subdirs, nil
+	return files, subdirs, rows.Err()
 }

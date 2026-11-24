@@ -32,9 +32,16 @@ func Init(t testing.TB, p string) *db.DB {
 	return d
 }
 
-// PrintV12 turns a current schema back into v12: no directory prints. Start of
-// a v12 migration fixture.
-const PrintV12 = `DROP TABLE dir_print_entry;
+// UnhashedV13 turns a current schema back into v13: no unhashed counts on dirs.
+// Start of a v13 migration fixture.
+const UnhashedV13 = `ALTER TABLE dir DROP COLUMN unhashed_below;
+DELETE FROM schema_version;
+INSERT INTO schema_version (version) VALUES (13);
+`
+
+// PrintV12 turns a current schema back into v12 (UnhashedV13, then no directory
+// prints). Start of a v12 migration fixture.
+const PrintV12 = UnhashedV13 + `DROP TABLE dir_print_entry;
 DROP TABLE dir_print_tag;
 DROP TABLE dir_print;
 DELETE FROM schema_version;

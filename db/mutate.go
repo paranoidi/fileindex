@@ -32,8 +32,20 @@ func (d *DB) MoveInstance(id int64, dstDir, name string) error {
 	if err != nil {
 		return err
 	}
+	var old int64
+	var unhashed bool
+	if err := tx.QueryRow("SELECT dir_id, file_id IS NULL FROM instance WHERE id = ?", id).Scan(&old, &unhashed); err != nil && err != sql.ErrNoRows {
+		return err
+	}
 	if _, err := tx.Exec("UPDATE instance SET dir_id = ?, filename = ?, filename_lower = ? WHERE id = ?", dirID, name, Lower(name), id); err != nil {
 		return err
+	}
+	if unhashed {
+		deltas := unhashedDeltas{old: -1}
+		deltas.add(dirID, 1)
+		if err := bumpUnhashed(tx, deltas); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -49,7 +61,21 @@ func (d *DB) MoveDir(id int64, dstParent, name string) error {
 	if err != nil {
 		return err
 	}
+	var n int64
+	var old sql.NullInt64
+	if err := tx.QueryRow("SELECT unhashed_below, parent_id FROM dir WHERE id = ?", id).Scan(&n, &old); err != nil && err != sql.ErrNoRows {
+		return err
+	}
 	if _, err := tx.Exec("UPDATE dir SET parent_id = ?, name = ?, name_lower = ? WHERE id = ?", parent, name, Lower(name), id); err != nil {
+		return err
+	}
+	// One bump: the old and the new parent chain share ancestors, where the deltas cancel.
+	deltas := unhashedDeltas{}
+	deltas.add(parent, n)
+	if old.Valid {
+		deltas[old.Int64] -= n
+	}
+	if err := bumpUnhashed(tx, deltas); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -65,7 +91,26 @@ func (d *DB) MergeDir(src, dst int64) (dirs, files int64, err error) {
 		return 0, 0, err
 	}
 	defer tx.Rollback()
+	// src's subtree leaves its parent chain for dst's; mergeDir settles dst itself.
+	var n int64
+	var srcParent, dstParent sql.NullInt64
+	if err := tx.QueryRow("SELECT unhashed_below, parent_id FROM dir WHERE id = ?", src).Scan(&n, &srcParent); err != nil && err != sql.ErrNoRows {
+		return 0, 0, err
+	}
+	if err := tx.QueryRow("SELECT parent_id FROM dir WHERE id = ?", dst).Scan(&dstParent); err != nil && err != sql.ErrNoRows {
+		return 0, 0, err
+	}
 	if dirs, files, err = mergeDir(tx, src, dst); err != nil {
+		return 0, 0, err
+	}
+	deltas := unhashedDeltas{}
+	if srcParent.Valid {
+		deltas[srcParent.Int64] -= n
+	}
+	if dstParent.Valid {
+		deltas[dstParent.Int64] += n
+	}
+	if err := bumpUnhashed(tx, deltas); err != nil {
 		return 0, 0, err
 	}
 	return dirs, files, tx.Commit()
@@ -122,6 +167,10 @@ WHERE s.parent_id = ? ORDER BY s.name`, dst, src)
 	}
 
 	if _, err := tx.Exec("UPDATE OR IGNORE dir_tag SET dir_id = ? WHERE dir_id = ?", dst, src); err != nil {
+		return 0, 0, err
+	}
+	// src's subtree, children re-parented or merged included, now counts under dst
+	if _, err := tx.Exec("UPDATE dir SET unhashed_below = unhashed_below + (SELECT unhashed_below FROM dir WHERE id = ?) WHERE id = ?", src, dst); err != nil {
 		return 0, 0, err
 	}
 	// leftover clashing tags go with src via ON DELETE CASCADE

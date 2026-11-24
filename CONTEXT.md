@@ -13,7 +13,7 @@ One location of a File: a filename inside a Dir. It records the size and mtime s
 _Avoid_: copy, path entry
 
 **Dir**:
-A directory node in the indexed tree; Dirs form a hierarchy from the filesystem root.
+A directory node in the indexed tree; Dirs form a hierarchy from the filesystem root. It counts the unhashed Instances in its subtree (`unhashed_below`), kept by every writer, so a listing can tell a Dir still waiting for hashes without walking it.
 
 **Tag**:
 A user-assigned label on a File's content or on a Dir. A File's Tag outlives its File: it applies again when the same content returns.

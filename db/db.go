@@ -1,4 +1,4 @@
-// Package db holds the schema v13 SQLite index and every query on it.
+// Package db holds the schema v14 SQLite index and every query on it.
 //
 // Read TIMESTAMP columns (mtime, created_at, last_seen) as CAST(col AS TEXT):
 // the driver otherwise parses them into time.Time and reformats them.
@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const SchemaVersion = 13
+const SchemaVersion = 14
 
 // Querier is satisfied by *sql.DB and *sql.Tx, so helpers can run inside a caller's transaction.
 type Querier interface {
@@ -66,6 +66,7 @@ CREATE TABLE dir (
     name_lower TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    unhashed_below INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (parent_id) REFERENCES dir(id) ON DELETE CASCADE,
     UNIQUE(parent_id, name)
 );
@@ -101,7 +102,7 @@ CREATE INDEX idx_file_sha256_noexif_jpeg ON file(sha256_noexif_jpeg);
 CREATE INDEX idx_file_sha256_sample ON file(sha256_sample);
 CREATE INDEX idx_file_size ON file(filesize);
 CREATE INDEX idx_dir_tag_dir_id ON dir_tag(dir_id);
-` + instanceIndexes + sampleTagSchema + dirPrintSchema + ftsSchema + `INSERT INTO schema_version (version) VALUES (13);
+` + instanceIndexes + sampleTagSchema + dirPrintSchema + ftsSchema + `INSERT INTO schema_version (version) VALUES (14);
 `
 
 // contentTagSchema holds file tags. A content tag is keyed by sha256, not file.id:
@@ -409,7 +410,7 @@ func (d *DB) Init() error {
 	return d.RequireSchema()
 }
 
-// Upgrade migrates a v6 to v12 DB to the current schema, announced on w
+// Upgrade migrates a v6 to v13 DB to the current schema, announced on w
 // since rebuilding the FTS indexes takes minutes on millions of instances. A DB
 // already current is left alone.
 func (d *DB) Upgrade(w io.Writer) error {
@@ -441,8 +442,33 @@ func (d *DB) Upgrade(w io.Writer) error {
 		}
 		fmt.Fprintln(w, "Fast hashes were cleared: `scan --fast` or a full scan hashes those files again.")
 	}
-	fmt.Fprintln(w, "Migrating database to schema v13 (directory tags kept by their files)...")
-	return d.execTx(dirPrintSchema + "INSERT INTO schema_version (version) VALUES (13);")
+	if v.Int64 < 13 {
+		fmt.Fprintln(w, "Migrating database to schema v13 (directory tags kept by their files)...")
+		if err := d.execTx(dirPrintSchema + "INSERT INTO schema_version (version) VALUES (13);"); err != nil {
+			return err
+		}
+	}
+	fmt.Fprintln(w, "Migrating database to schema v14 (unhashed files counted per directory)...")
+	return d.migrateV13()
+}
+
+// migrateV13 adds dir.unhashed_below and counts it.
+func (d *DB) migrateV13() error {
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("ALTER TABLE dir ADD COLUMN unhashed_below INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := recount(tx); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("INSERT INTO schema_version (version) VALUES (14)"); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // upgradeToV10 runs the migrations up to v10 from a v6, v7, v8 or v9 DB.

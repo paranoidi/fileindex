@@ -285,22 +285,26 @@ func recordDirs(tx Querier, paths []string) error {
 }
 
 // deleteTree deletes the dir at path and everything under it, returning the
-// instances and dirs removed. The tagged dirs in it keep a print first
+// instances and dirs removed and the unhashed instances among them, which the
+// caller takes off the dir's parent chain. The tagged dirs in it keep a print first
 // (keepDirPrints, logged to log, which may be nil). Instances go first and
 // explicitly so their FTS triggers run; subdirs and dir_tag rows go by ON DELETE
 // CASCADE.
-func deleteTree(q Querier, id int64, path string, log func(string)) (files, dirs int64, err error) {
+func deleteTree(q Querier, id int64, path string, log func(string)) (files, dirs, unhashed int64, err error) {
 	if err := q.QueryRow(treeCTE+"SELECT COUNT(*) FROM dir_tree", id).Scan(&dirs); err != nil || dirs == 0 {
-		return 0, 0, err
+		return 0, 0, 0, err
+	}
+	if err := q.QueryRow("SELECT unhashed_below FROM dir WHERE id = ?", id).Scan(&unhashed); err != nil {
+		return 0, 0, 0, err
 	}
 	if err := keepDirPrints(q, id, path, log); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	if files, err = deleteInstancesInTree(q, id); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	if _, err := q.Exec("DELETE FROM dir WHERE id = ?", id); err != nil {
-		return files, 0, err
+		return files, 0, 0, err
 	}
-	return files, dirs, nil
+	return files, dirs, unhashed, nil
 }

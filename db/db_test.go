@@ -1513,7 +1513,7 @@ func TestMigrateV12(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out strings.Builder
-	if err := d.Upgrade(&out); err != nil || !strings.Contains(out.String(), "schema v13") || strings.Contains(out.String(), "schema v12") {
+	if err := d.Upgrade(&out); err != nil || !strings.Contains(out.String(), "schema v13") || !strings.Contains(out.String(), "schema v14") || strings.Contains(out.String(), "schema v12") {
 		t.Fatalf("Upgrade: %v, %q", err, out.String())
 	}
 	if err := d.RequireSchema(); err != nil {
@@ -1523,6 +1523,36 @@ func TestMigrateV12(t *testing.T) {
 		if ok, err := dbHasTable(d, table); err != nil || !ok {
 			t.Errorf("%s: %v, %v", table, ok, err)
 		}
+	}
+}
+
+// A v13 DB gains the unhashed counts, counted from its instances.
+func TestMigrateV13(t *testing.T) {
+	d := dbtest.New(t)
+	dbtest.AddFile(t, d, "/m/a/harbor.txt", "harbor")
+	if _, err := d.CommitDiscovered([]db.DiscoveredFile{
+		{Dir: "/m/a/b", Name: "meadow", Size: 3, Mtime: time.Unix(1700000000, 0)},
+		{Dir: "/m/c", Name: "orchard", Size: 3, Mtime: time.Unix(1700000000, 0)},
+		{Dir: "/m/c", Name: "lantern", Size: 3, Mtime: time.Unix(1700000000, 0)},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(dbtest.UnhashedV13); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.RequireSchema(); err != db.ErrOutdatedSchema {
+		t.Fatalf("RequireSchema = %v", err)
+	}
+	var out strings.Builder
+	if err := d.Upgrade(&out); err != nil || !strings.Contains(out.String(), "schema v14") || strings.Contains(out.String(), "schema v13") {
+		t.Fatalf("Upgrade: %v, %q", err, out.String())
+	}
+	if err := d.RequireSchema(); err != nil {
+		t.Fatal(err)
+	}
+	checkUnhashed(t, d)
+	if got := unhashedOf(t, d, "/m"); got != 3 {
+		t.Errorf("unhashed under /m = %d, want 3", got)
 	}
 }
 
