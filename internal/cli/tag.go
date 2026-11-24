@@ -148,7 +148,7 @@ directory record.`,
 func tagsCmd(a *app) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "tags",
-		Short: "List or delete tags",
+		Short: "List, rename or delete tags",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cmd.Root().SetOut(a.stdout)
@@ -188,6 +188,21 @@ func tagsCmd(a *app) *cobra.Command {
 				dirs += t.Dirs
 			}
 			fmt.Fprintf(w, "\nTotal: %d tag(s), %d file(s), %d dir(s)\n", len(tags), files, dirs)
+			return nil
+		},
+	}, &cobra.Command{
+		Use:   "rename OLD NEW",
+		Short: "Rename a tag, keeping all its associations",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(_ *cobra.Command, args []string) error {
+			d, err := a.openDB()
+			if err != nil {
+				return err
+			}
+			if err := d.RenameTag(args[0], args[1]); err != nil {
+				return err
+			}
+			fmt.Fprintf(a.stdout, "Renamed tag #%s to #%s\n", args[0], args[1])
 			return nil
 		},
 	}, &cobra.Command{

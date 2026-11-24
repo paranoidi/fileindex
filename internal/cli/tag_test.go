@@ -112,6 +112,45 @@ func TestTagsListRm(t *testing.T) {
 	}
 }
 
+func TestTagsRename(t *testing.T) {
+	h, tree := tagTree(t)
+	photos := filepath.Join(tree, "photos")
+	img := filepath.Join(photos, "img1.jpg")
+	h.mustRun("tag", img, "vacation", "other")
+	h.mustRun("tag", photos, "vacation")
+	before := h.mustRun("tags", "list")
+
+	for _, c := range []struct{ from, to, want string }{
+		{"nope", "holiday", "Error: Tag not found: nope\n"},
+		{"nope", "other", "Error: Tag not found: nope\n"},
+		{"vacation", "other", "Error: Tag already exists: other\n"},
+		{"vacation", "vacation", "Error: Tag already exists: vacation\n"},
+	} {
+		if code, _, errOut := h.run("tags", "rename", c.from, c.to); code != 1 || errOut != c.want {
+			t.Errorf("%s to %s: exit %d %q", c.from, c.to, code, errOut)
+		}
+	}
+	if out := h.mustRun("tags", "list"); out != before {
+		t.Errorf("failed renames changed the tags:\n%s", out)
+	}
+
+	if out := h.mustRun("tags", "rename", "vacation", "Vacation"); out != "Renamed tag #vacation to #Vacation\n" {
+		t.Errorf("rename: %q", out)
+	}
+	out := h.mustRun("tags", "list")
+	for _, row := range []string{"#Vacation          1         1\n", "#other             1         0\n", "Total: 2 tag(s), 2 file(s), 1 dir(s)"} {
+		if !strings.Contains(out, row) {
+			t.Errorf("list lacks %q:\n%s", row, out)
+		}
+	}
+	if out := h.mustRun("find-tagged", "-r", tree, "Vacation"); out != "Found 2 match(es) with all tags #Vacation:\n\n"+img+"\n"+photos+"/\n" {
+		t.Errorf("new name: %q", out)
+	}
+	if code, _, _ := h.run("find-tagged", "-r", tree, "vacation"); code != 1 {
+		t.Errorf("old name: exit %d", code)
+	}
+}
+
 func TestFindTagged(t *testing.T) {
 	h, tree := tagTree(t)
 	photos := filepath.Join(tree, "photos")

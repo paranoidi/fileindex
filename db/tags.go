@@ -279,6 +279,22 @@ func (d *DB) ListTags() ([]TagCount, error) {
 	return out, rows.Err()
 }
 
+// RenameTag renames a tag; its associations, held by id, follow. It does not merge
+// into an existing tag.
+func (d *DB) RenameTag(oldName, newName string) error {
+	ids, found, err := tagIDs(d, []string{oldName, newName})
+	switch {
+	case err != nil:
+		return err
+	case !slices.Contains(found, oldName):
+		return fmt.Errorf("Tag not found: %s", oldName)
+	case slices.Contains(found, newName):
+		return fmt.Errorf("Tag already exists: %s", newName)
+	}
+	_, err = d.Exec("UPDATE tag SET name = ? WHERE id = ?", newName, ids[0])
+	return err
+}
+
 // DeleteTag deletes a tag and, by cascade, its associations; returns how many there were.
 func (d *DB) DeleteTag(name string) (int, error) {
 	var id int64
