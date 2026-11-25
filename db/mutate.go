@@ -100,6 +100,19 @@ func (d *DB) MergeDir(src, dst int64) (dirs, files int64, err error) {
 	if err := tx.QueryRow("SELECT parent_id FROM dir WHERE id = ?", dst).Scan(&dstParent); err != nil && err != sql.ErrNoRows {
 		return 0, 0, err
 	}
+	var inside bool
+	if err := tx.QueryRow(`WITH RECURSIVE up(id) AS (SELECT ? UNION ALL SELECT d.parent_id FROM dir d JOIN up ON d.id = up.id WHERE d.parent_id IS NOT NULL)
+SELECT EXISTS (SELECT 1 FROM up WHERE id = ?)`, dst, src).Scan(&inside); err != nil {
+		return 0, 0, err
+	}
+	if inside {
+		return 0, 0, fmt.Errorf("Cannot merge a directory into itself or its own subdirectory")
+	}
+	// Detached, src can't be matched by name as a child of dst, or of a dir on the
+	// way to it, when src lies below dst: it would be merged into itself and deleted.
+	if _, err := tx.Exec("UPDATE dir SET parent_id = NULL WHERE id = ?", src); err != nil {
+		return 0, 0, err
+	}
 	if dirs, files, err = mergeDir(tx, src, dst); err != nil {
 		return 0, 0, err
 	}
