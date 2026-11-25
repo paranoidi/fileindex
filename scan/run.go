@@ -134,7 +134,7 @@ func ResolveRoots(args []string) ([]string, error) {
 // cannot be hashed stays unhashed and is retried by the next run.
 //
 // Memory does not grow with the file count: the walk streams into one batch
-// (plus one dir's records for the skip check) and hashing pages through
+// (plus one dir's records for the skip check and the few dirs read ahead) and hashing pages through
 // unhashed instances by id, one page at a time; nothing collects the file list.
 // Hashing does hold each root's dir ids (see db.UnhashedPages).
 //
@@ -327,11 +327,15 @@ func discover(ctx context.Context, d *db.DB, opt Options, maxFiles int, roots []
 			werr = flush()
 		}
 	}
-	// Resolve costs an lstat per path component, so it runs once per dir, here:
-	// the walk enters a dir before yielding its files.
+	// Resolve costs an lstat per path component, so it runs once per dir, here (the
+	// walk enters a dir before yielding its files), and only when the walk can pass
+	// a symlink: the roots are resolved already.
 	walkedDir, realDir, realErr := "", "", error(nil)
 	onDir := func(dir string) {
-		real, err := db.Resolve(dir)
+		real, err := dir, error(nil)
+		if opt.Rules.FollowSymlinks {
+			real, err = db.Resolve(dir)
+		}
 		walkedDir, realDir, realErr = dir, real, err
 		if werr != nil || err != nil {
 			return
